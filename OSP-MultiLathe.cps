@@ -38,8 +38,8 @@ minimumCircularRadius = spatial(0.01, MM);
 maximumCircularRadius = spatial(1000, MM);
 minimumCircularSweep = toRad(0.01);
 maximumCircularSweep = toRad(90);
-allowHelicalMoves = false;
-allowedCircularPlanes = (1 << PLANE_ZX);
+allowHelicalMoves = true;
+allowedCircularPlanes = (1 << PLANE_ZX) | (1 << PLANE_XY) | (1 << PLANE_YZ);
 allowSpiralMoves = false;
 allowFeedPerRevolutionDrilling = true;
 highFeedrate = (unit == IN) ? 100 : 2500;
@@ -146,7 +146,7 @@ properties = {
     group      : "Options",
     type       : "integer",
     range      : [0, 999999999],
-    value      : 3500,
+    value      : 2500,
     scope      : "post"
   },
   maximumSubSpindleSpeed: {
@@ -214,6 +214,14 @@ properties = {
     value      : false,
     scope      : "post"
   },
+  warnSpindleTap: {
+    title      : "Warn on spindle tapping (G77/G78)",
+    description: "Show a warning when tapping uses G77/G78 (main spindle float-tap) instead of G178/G179 (live tool). Disable to suppress the warning.",
+    group      : "Options",
+    type       : "boolean",
+    value      : true,
+    scope      : "post"
+  },
   showNotes: {
     title      : "Show notes",
     description: "Writes operation notes as comments in the output.",
@@ -270,17 +278,24 @@ var taperFormat = createFormat({decimals:1, scale:DEG});
 var integerFormat = createFormat({decimals:0});
 var oFormat = createFormat({decimals:0, minDigitsLeft:4});
 
+var yFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
+var cFormat = createFormat({decimals:3, type:FORMAT_REAL, scale:DEG});
+
 // output variables
 var xOutput = createOutputVariable({prefix:"X"}, xFormat);
+var yOutput = createOutputVariable({prefix:"Y"}, yFormat);
 var zOutput = createOutputVariable({prefix:"Z"}, zFormat);
+var cOutput = createOutputVariable({prefix:"C"}, cFormat);
 var feedOutput = createOutputVariable({prefix:"F"}, feedFormat);
 var pitchOutput = createOutputVariable({prefix:"F", control:CONTROL_FORCE}, pitchFormat);
 var sOutput = createOutputVariable({prefix:"S", control:CONTROL_FORCE}, rpmFormat);
+var sbOutput = createOutputVariable({prefix:"SB=", control:CONTROL_FORCE}, rpmFormat);
 var maxSpeedOutput = createOutputVariable({prefix:"S", control:CONTROL_FORCE}, rpmFormat);
 var eOutput = createOutputVariable({prefix:"E", control:CONTROL_FORCE}, secFormat);
 
 // circular output — Okuma uses I/K for center-point arcs
 var iOutput = createOutputVariable({prefix:"I", control:CONTROL_NONZERO}, spatialFormat);
+var jOutput = createOutputVariable({prefix:"J", control:CONTROL_NONZERO}, spatialFormat);
 var kOutput = createOutputVariable({prefix:"K", control:CONTROL_NONZERO}, spatialFormat);
 
 // modal groups
@@ -290,6 +305,7 @@ var gFeedModeModal = createOutputVariable({}, gFormat);
 var gSpindleModeModal = createOutputVariable({}, gFormat);
 var gAbsIncModal = createOutputVariable({}, gFormat);
 var gCycleModal = createOutputVariable({}, gFormat);
+var gMachiningModeModal = createOutputVariable({}, gFormat);
 
 // state tracking
 var sequenceNumber;
@@ -304,14 +320,27 @@ var lastSpindleMode = undefined;
 var lastSpindleSpeed = 0;
 var lastSpindleDirection = undefined;
 var forceCoolant = false;
-var retracted = false;
 var skipThreading = false;
+var pendingRadiusCompensation = -1;
+var saveShowSequenceNumbers;
+
+var MACHINING_DIRECTION_AXIAL = 0;
+var MACHINING_DIRECTION_RADIAL = 1;
+var MACHINING_DIRECTION_INDEXING = 2;
 
 var machineState = {
   isTurningOperation  : undefined,
   liveToolIsActive    : false,
   feedPerRevolution   : undefined,
-  currentSpindle      : 0
+  currentSpindle      : 0,
+  cAxisIsEngaged      : false,
+  pendingM960         : false,
+  pendingFeedMode     : undefined,
+  pendingCoolant      : undefined,
+  usePolarMode        : false,
+  useCartesianPolar   : false,
+  feedIsDPM           : false,
+  machiningDirection  : undefined
 };
 
 function hasLiveTooling() {
@@ -333,6 +362,93 @@ function isMultus() {
 function getMaxSpindleSpeed() {
   var prop = (machineState.currentSpindle == 1) ? "maximumSubSpindleSpeed" : "maximumSpindleSpeed";
   return getProperty(prop);
+}
+
+function getMachiningDirection(section) {
+  var forward = section.isMultiAxis() ? section.getGlobalInitialToolAxis() : section.workPlane.forward;
+  if (isSameDirection(forward, new Vector(0, 0, 1))) {
+    return MACHINING_DIRECTION_AXIAL;
+  } else if (Vector.dot(forward, new Vector(0, 0, 1)) < 1e-7) {
+    return MACHINING_DIRECTION_RADIAL;
+  } else {
+    return MACHINING_DIRECTION_INDEXING;
+  }
+}
+
+function getC(x, y) {
+  return Math.atan2(y, x);
+}
+
+function getModulus(x, y) {
+  return Math.sqrt(x * x + y * y);
+}
+
+function getCClosest(x, y, _c) {
+  if (!xFormat.isSignificant(x) && !yFormat.isSignificant(y)) {
+    return _c;
+  }
+  var c = getC(x, y);
+  if (c < 0) {
+    c += Math.PI * 2;
+  }
+  return c;
+}
+
+function engageCAxis() {
+  if (!machineState.cAxisIsEngaged) {
+    writeBlock(gMachiningModeModal.format(271));
+    machineState.cAxisIsEngaged = true;
+    machineState.pendingM960 = true;
+    gMotionModal.reset();
+  }
+}
+
+function flushM960() {
+  if (machineState.pendingM960) {
+    machineState.pendingM960 = false;
+    return mFormat.format(960);
+  }
+  return undefined;
+}
+
+function flushFeedMode() {
+  if (machineState.pendingFeedMode) {
+    var result = machineState.pendingFeedMode;
+    machineState.pendingFeedMode = undefined;
+    return result;
+  }
+  return undefined;
+}
+
+function flushCoolant() {
+  if (machineState.pendingCoolant !== undefined) {
+    var coolant = machineState.pendingCoolant;
+    machineState.pendingCoolant = undefined;
+    setCoolant(coolant);
+  }
+}
+
+function disengageCAxis() {
+  if (machineState.cAxisIsEngaged) {
+    writeBlock(gMachiningModeModal.format(270));
+    machineState.cAxisIsEngaged = false;
+    gMotionModal.reset();
+  }
+}
+
+function setPolarMode(activate) {
+  if (activate) {
+    writeBlock(gFormat.format(137));
+    machineState.usePolarMode = true;
+    machineState.useCartesianPolar = true;
+    gMotionModal.reset();
+  } else {
+    writeBlock(gFormat.format(136));
+    machineState.usePolarMode = false;
+    machineState.useCartesianPolar = false;
+    machineState.feedIsDPM = false;
+    gPlaneModal.reset();
+  }
 }
 
 function validateMachineConfig() {
@@ -388,7 +504,9 @@ function writeComment(text) {
 
 function forceXYZ() {
   xOutput.reset();
+  yOutput.reset();
   zOutput.reset();
+  cOutput.reset();
 }
 
 function forceFeed() {
@@ -421,7 +539,14 @@ function getFeed(f) {
     }
     currentFeedId = feedContext != undefined ? feedContext.id : undefined;
   }
-  return feedOutput.format(f);
+  var result = feedOutput.format(f);
+  if (result) {
+    var fm = flushFeedMode();
+    if (fm) {
+      result += " " + fm;
+    }
+  }
+  return result;
 }
 
 function formatFeedMode(mode) {
@@ -432,6 +557,112 @@ function formatFeedMode(mode) {
     machineState.feedPerRevolution = false;
     return gFeedModeModal.format(94);
   }
+}
+
+var currentCoolantMode = COOLANT_OFF;
+
+function setCoolant(coolant) {
+  var coolantCodes = getCoolantCodes(coolant);
+  if (Array.isArray(coolantCodes)) {
+    for (var c in coolantCodes) {
+      writeBlock(coolantCodes[c]);
+    }
+    return undefined;
+  }
+  return coolantCodes;
+}
+
+function getCoolantCodes(coolant) {
+  if (coolant == currentCoolantMode && !forceCoolant) {
+    return undefined;
+  }
+  forceCoolant = false;
+
+  var m = [];
+  if (coolant == COOLANT_OFF) {
+    if (currentCoolantMode != COOLANT_OFF) {
+      m.push(mFormat.format(9));
+    }
+    currentCoolantMode = COOLANT_OFF;
+    return m;
+  }
+
+  if (currentCoolantMode != COOLANT_OFF) {
+    m.push(mFormat.format(9));
+  }
+
+  switch (coolant) {
+  case COOLANT_FLOOD:
+    m.push(mFormat.format(8));
+    break;
+  case COOLANT_THROUGH_TOOL:
+    m.push(mFormat.format(8));
+    break;
+  case COOLANT_MIST:
+    m.push(mFormat.format(8));
+    break;
+  default:
+    warning(localize("Coolant type not supported, using flood coolant."));
+    m.push(mFormat.format(8));
+  }
+
+  currentCoolantMode = coolant;
+  return m;
+}
+
+function startSpindle(enableCSS) {
+  var isLiveTool = machineState.liveToolIsActive;
+  var _spindleSpeed;
+  var spindleMode;
+
+  gSpindleModeModal.reset();
+
+  if (isLiveTool) {
+    if (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED) {
+      error(localize("Constant surface speed (G96) is not supported with live tooling."));
+      return;
+    }
+    _spindleSpeed = spindleSpeed;
+    var spindleDir = mFormat.format(tool.clockwise ? 13 : 14);
+    writeBlock(sbOutput.format(_spindleSpeed), spindleDir);
+    lastSpindleMode = tool.getSpindleMode();
+    lastSpindleSpeed = _spindleSpeed;
+    lastSpindleDirection = tool.clockwise;
+    return;
+  }
+
+  var spindleDir = mFormat.format(tool.clockwise ? 3 : 4);
+  var maximumSpindleSpeed = (tool.maximumSpindleSpeed > 0) ? Math.min(tool.maximumSpindleSpeed, getMaxSpindleSpeed()) : getMaxSpindleSpeed();
+
+  if (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED) {
+    if (enableCSS) {
+      _spindleSpeed = tool.surfaceSpeed * ((unit == MM) ? 1 / 1000.0 : 1 / 12.0);
+      spindleMode = 96;
+    } else {
+      var initialPosition = getFramePosition(currentSection.getInitialPosition());
+      if (xFormat.getResultingValue(initialPosition.x) == 0) {
+        _spindleSpeed = maximumSpindleSpeed;
+      } else {
+        _spindleSpeed = Math.min((tool.surfaceSpeed * ((unit == MM) ? 1000.0 : 12.0) / (Math.PI * Math.abs(initialPosition.x * 2))), maximumSpindleSpeed);
+      }
+      spindleMode = 97;
+    }
+  } else {
+    _spindleSpeed = spindleSpeed;
+    if (_spindleSpeed > maximumSpindleSpeed) {
+      warning(localize("Tool " + tool.number + " requests S" + rpmFormat.format(_spindleSpeed) +
+        " but max spindle speed is " + rpmFormat.format(maximumSpindleSpeed) +
+        ". Speed clamped to S" + rpmFormat.format(maximumSpindleSpeed) + "."));
+      _spindleSpeed = maximumSpindleSpeed;
+    }
+    spindleMode = 97;
+  }
+
+  writeBlock(gSpindleModeModal.format(spindleMode), sOutput.format(_spindleSpeed), spindleDir);
+
+  lastSpindleMode = tool.getSpindleMode();
+  lastSpindleSpeed = _spindleSpeed;
+  lastSpindleDirection = tool.clockwise;
 }
 
 function writeRetract() {
@@ -548,7 +779,6 @@ function onOpen() {
 
   // Safe startup
   writeBlock(gAbsIncModal.format(90));
-  writeBlock(gPlaneModal.format(18));
 
   // G50 max spindle speed clamp
   var mTool = getSection(0).getTool();
@@ -570,16 +800,57 @@ function onComment(message) {
 function onSection() {
   machineState.isTurningOperation = (currentSection.getType() == TYPE_TURNING);
   machineState.liveToolIsActive = false;
+  machineState.usePolarMode = false;
+  machineState.machiningDirection = undefined;
 
   if (!machineState.isTurningOperation) {
-    if (!hasLiveTooling()) {
-      error(localize("Milling/drilling operations require live tooling. Enable the 'Type M' or 'Type Multus' property."));
-      return;
-    }
+    machineState.machiningDirection = getMachiningDirection(currentSection);
+    var toolIsLive = tool.isLiveTool && tool.isLiveTool();
+
     if (!currentSection.isMultiAxis() && isDrillingCycle()) {
+      if (toolIsLive) {
+        if (!hasLiveTooling()) {
+          error(localize("Live tool drilling requires live tooling. Enable the 'Type M' or 'Type Multus' property."));
+          return;
+        }
+        machineState.liveToolIsActive = true;
+      }
+    } else if (currentSection.isMultiAxis()) {
+      var isWrapped = currentSection.polarMode != undefined && currentSection.polarMode != POLAR_MODE_OFF;
+      if (isWrapped) {
+        if (!hasLiveTooling()) {
+          error(localize("Wrapped milling requires live tooling. Enable the 'Type M' or 'Type Multus' property."));
+          return;
+        }
+        machineState.liveToolIsActive = true;
+        machineState.usePolarMode = true;
+      } else {
+        error(localize("Multi-axis simultaneous toolpaths (4/5-axis) are not supported."));
+        return;
+      }
+    } else if (currentSection.getType() == TYPE_MILLING) {
+      if (!hasLiveTooling()) {
+        error(localize("Milling operations require live tooling. Enable the 'Type M' or 'Type Multus' property."));
+        return;
+      }
       machineState.liveToolIsActive = true;
+      if (machineState.machiningDirection == MACHINING_DIRECTION_AXIAL) {
+        machineState.usePolarMode = true;
+      } else if (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) {
+        if (!hasYAxis()) {
+          error(localize("Radial milling requires a Y-axis (G272). This machine does not have Y-axis capability." +
+            " Use 'Wrap' machining type in Fusion for C-axis substitution, or enable the Y-axis property."));
+          return;
+        }
+      } else {
+        if (!hasYAxis()) {
+          error(localize("This milling operation requires a Y-axis. Use 'Wrap' machining type in Fusion" +
+            " for C-axis substitution, or enable the Y-axis property."));
+          return;
+        }
+      }
     } else {
-      warning(localize("Milling operations beyond drilling/tapping are not yet supported. Skipping operation."));
+      warning(localize("Unsupported milling operation type. Skipping operation."));
       skipRemainingSection();
       return;
     }
@@ -634,15 +905,11 @@ function onSection() {
     }
   }
 
-  // Feed mode
+  // Feed mode — defer to first feed line
   if (insertToolCall) {
     forceModals();
   }
-  var feedMode = formatFeedMode(currentSection.feedMode);
-
-  // Turning plane
-  writeBlock(gPlaneModal.format(18));
-  writeBlock(feedMode);
+  machineState.pendingFeedMode = formatFeedMode(currentSection.feedMode);
 
   // G50 max spindle speed — re-output if changed
   var maximumSpindleSpeed = (tool.maximumSpindleSpeed > 0) ? Math.min(tool.maximumSpindleSpeed, getMaxSpindleSpeed()) : getMaxSpindleSpeed();
@@ -696,9 +963,26 @@ function onSection() {
     if (tool.comment) {
       writeComment(tool.comment);
     }
+  }
 
-    // Turn on coolant
-    setCoolant(tool.coolant);
+  // Machining mode — reset modal on tool change so G270/G271 is explicit at each new tool
+  if (insertToolCall) {
+    gMachiningModeModal.reset();
+    machineState.cAxisIsEngaged = false;
+  }
+  if (machineState.liveToolIsActive && !machineState.isTurningOperation) {
+    engageCAxis();
+  } else {
+    if (machineState.cAxisIsEngaged) {
+      disengageCAxis();
+    } else {
+      writeBlock(gMachiningModeModal.format(270));
+    }
+  }
+
+  // Coolant — defer to just before first feed move
+  if (insertToolCall) {
+    machineState.pendingCoolant = tool.coolant;
   }
 
   // Spindle
@@ -708,12 +992,34 @@ function onSection() {
     startSpindle(false);
   }
 
+  // Polar mode — activate after spindle and before positioning
+  if (machineState.usePolarMode) {
+    writeBlock(mFormat.format(146));
+    if (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) {
+      writeBlock(gFormat.format(119));
+      cOutput.reset();
+      gMotionModal.reset();
+    } else {
+      setPolarMode(true);
+    }
+  }
+
   // Position to initial point
   forceAny();
   gMotionModal.reset();
 
   var initialPosition = getFramePosition(currentSection.getInitialPosition());
-  if (insertToolCall || retracted || (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED)) {
+  if (machineState.useCartesianPolar) {
+    xOutput.reset();
+    yOutput.reset();
+    writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
+    writeBlock(gMotionModal.format(0), xOutput.format(initialPosition.x), yOutput.format(initialPosition.y));
+  } else if (machineState.usePolarMode) {
+    var cx = getModulus(initialPosition.x, initialPosition.y);
+    var cc = getCClosest(initialPosition.x, initialPosition.y, cOutput.getCurrent());
+    writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
+    writeBlock(gMotionModal.format(0), xOutput.format(cx * 2), cOutput.format(cc), flushM960());
+  } else if (insertToolCall || (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED)) {
     gMotionModal.reset();
     writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
     writeBlock(gMotionModal.format(0), xOutput.format(initialPosition.x));
@@ -724,49 +1030,7 @@ function onSection() {
     startSpindle(true);
   }
 
-  retracted = false;
   activeMovements = undefined;
-}
-
-function startSpindle(enableCSS) {
-  var spindleDir = mFormat.format(tool.clockwise ? 3 : 4);
-  var _spindleSpeed;
-  var spindleMode;
-
-  gSpindleModeModal.reset();
-
-  var maximumSpindleSpeed = (tool.maximumSpindleSpeed > 0) ? Math.min(tool.maximumSpindleSpeed, getMaxSpindleSpeed()) : getMaxSpindleSpeed();
-
-  if (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED) {
-    if (enableCSS) {
-      _spindleSpeed = tool.surfaceSpeed * ((unit == MM) ? 1 / 1000.0 : 1 / 12.0);
-      spindleMode = 96;
-    } else {
-      // RPM mode for initial positioning — calculate RPM from CSS at initial X
-      var initialPosition = getFramePosition(currentSection.getInitialPosition());
-      if (xFormat.getResultingValue(initialPosition.x) == 0) {
-        _spindleSpeed = maximumSpindleSpeed;
-      } else {
-        _spindleSpeed = Math.min((tool.surfaceSpeed * ((unit == MM) ? 1000.0 : 12.0) / (Math.PI * Math.abs(initialPosition.x * 2))), maximumSpindleSpeed);
-      }
-      spindleMode = 97;
-    }
-  } else {
-    _spindleSpeed = spindleSpeed;
-    if (_spindleSpeed > maximumSpindleSpeed) {
-      error(localize("Tool " + tool.number + " requests S" + rpmFormat.format(_spindleSpeed) +
-        " but max spindle speed is " + rpmFormat.format(maximumSpindleSpeed) +
-        ". Reduce the RPM in your operation or increase the max spindle speed property."));
-      return;
-    }
-    spindleMode = 97;
-  }
-
-  writeBlock(gSpindleModeModal.format(spindleMode), sOutput.format(_spindleSpeed), spindleDir);
-
-  lastSpindleMode = tool.getSpindleMode();
-  lastSpindleSpeed = _spindleSpeed;
-  lastSpindleDirection = tool.clockwise;
 }
 
 function onDwell(seconds) {
@@ -776,13 +1040,44 @@ function onDwell(seconds) {
   writeBlock(gFormat.format(4), dwellFormat.format(seconds));
 }
 
-var pendingRadiusCompensation = -1;
-
 function onRadiusCompensation() {
   pendingRadiusCompensation = radiusCompensation;
 }
 
 function onRapid(_x, _y, _z) {
+  if (machineState.useCartesianPolar) {
+    // G137 alarm 2259: both X and Y must always be specified
+    xOutput.reset();
+    yOutput.reset();
+    var x = xOutput.format(_x);
+    var y = yOutput.format(_y);
+    var z = zOutput.format(_z);
+    if (x || y || z) {
+      if (pendingRadiusCompensation >= 0) {
+        error(localize("Radius compensation mode cannot be changed at rapid traversal."));
+        return;
+      }
+      writeBlock(gMotionModal.format(0), x, y, z);
+    }
+    return;
+  }
+
+  if (machineState.usePolarMode) {
+    var xr = getModulus(_x, _y);
+    var cc = getCClosest(_x, _y, cOutput.getCurrent());
+    var x = xOutput.format(xr * 2);
+    var c = cOutput.format(cc);
+    var z = zOutput.format(_z);
+    if (x || c || z) {
+      if (pendingRadiusCompensation >= 0) {
+        error(localize("Radius compensation mode cannot be changed at rapid traversal."));
+        return;
+      }
+      writeBlock(gMotionModal.format(0), x, c, z, flushM960());
+    }
+    return;
+  }
+
   var x = xOutput.format(_x);
   var z = zOutput.format(_z);
   if (x || z) {
@@ -795,20 +1090,86 @@ function onRapid(_x, _y, _z) {
 }
 
 function onLinear(_x, _y, _z, feed) {
+  flushCoolant();
   if (isSpeedFeedSynchronizationActive()) {
-    // Single-pass threading via G33
     var threadPitch = getParameter("operation:threadPitch");
     var threadsPerInch = 1.0 / threadPitch;
     var startXYZ = getCurrentPosition();
     var deltaX = spatialFormat.getResultingValue(_x - startXYZ.x);
+    // Okuma alarm 2250: first G33 block must have both X and Z
+    xOutput.reset();
+    zOutput.reset();
     writeBlock(
       gMotionModal.format(33),
       xOutput.format(_x),
       zOutput.format(_z),
       iOutput.format(deltaX),
-      pitchOutput.format(1 / threadsPerInch)
+      pitchOutput.format(1 / threadsPerInch),
+      flushFeedMode()
     );
     forceFeed();
+    return;
+  }
+
+  if (machineState.useCartesianPolar) {
+    // G137 alarm 2259: both X and Y must always be specified
+    xOutput.reset();
+    yOutput.reset();
+    var x = xOutput.format(_x);
+    var y = yOutput.format(_y);
+    var z = zOutput.format(_z);
+    if (x || y || z) {
+      var f = getFeed(feed);
+      if (pendingRadiusCompensation >= 0) {
+        pendingRadiusCompensation = -1;
+        switch (radiusCompensation) {
+        case RADIUS_COMPENSATION_LEFT:
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, f);
+          break;
+        case RADIUS_COMPENSATION_RIGHT:
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, f);
+          break;
+        default:
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, f);
+        }
+      } else {
+        writeBlock(gMotionModal.format(1), x, y, z, f);
+      }
+    }
+    return;
+  }
+
+  if (machineState.usePolarMode) {
+    var xr = getModulus(_x, _y);
+    var cc = getCClosest(_x, _y, cOutput.getCurrent());
+    var x = xOutput.format(xr * 2);
+    var c = cOutput.format(cc);
+    var z = zOutput.format(_z);
+    if (x || c || z) {
+      var cOnly = !x && !z && c;
+      if (cOnly != machineState.feedIsDPM) {
+        forceFeed();
+        machineState.feedIsDPM = cOnly;
+      }
+      var rawFeed = (cOnly && xr > 0) ? feedOutput.format(feed * 180 / (Math.PI * xr)) : getFeed(feed);
+      var fm = rawFeed ? flushFeedMode() : undefined;
+      var f = (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+      if (pendingRadiusCompensation >= 0) {
+        pendingRadiusCompensation = -1;
+        switch (radiusCompensation) {
+        case RADIUS_COMPENSATION_LEFT:
+          writeBlock(gMotionModal.format(101), gFormat.format(41), x, c, z, f, flushM960());
+          break;
+        case RADIUS_COMPENSATION_RIGHT:
+          writeBlock(gMotionModal.format(101), gFormat.format(42), x, c, z, f, flushM960());
+          break;
+        default:
+          writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
+        }
+      } else {
+        writeBlock(gMotionModal.format(101), x, c, z, f, flushM960());
+      }
+    }
     return;
   }
 
@@ -817,16 +1178,15 @@ function onLinear(_x, _y, _z, feed) {
   if (x || z) {
     if (pendingRadiusCompensation >= 0) {
       pendingRadiusCompensation = -1;
-      writeBlock(gPlaneModal.format(18));
       switch (radiusCompensation) {
       case RADIUS_COMPENSATION_LEFT:
-        writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, getFeed(feed));
+        writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, getFeed(feed), gPlaneModal.format(18));
         break;
       case RADIUS_COMPENSATION_RIGHT:
-        writeBlock(gMotionModal.format(1), gFormat.format(42), x, z, getFeed(feed));
+        writeBlock(gMotionModal.format(1), gFormat.format(42), x, z, getFeed(feed), gPlaneModal.format(18));
         break;
       default:
-        writeBlock(gMotionModal.format(1), gFormat.format(40), x, z, getFeed(feed));
+        writeBlock(gMotionModal.format(1), gFormat.format(40), x, z, getFeed(feed), gPlaneModal.format(18));
       }
     } else {
       writeBlock(gMotionModal.format(1), x, z, getFeed(feed));
@@ -834,7 +1194,65 @@ function onLinear(_x, _y, _z, feed) {
   }
 }
 
+function onRapid5D(_x, _y, _z, _a, _b, _c) {
+  if (!machineState.usePolarMode) {
+    error(localize("Multi-axis simultaneous toolpath is not supported by the post."));
+    return;
+  }
+  var xr = getModulus(_x, _y);
+  var cc = getCClosest(_x, _y, cOutput.getCurrent());
+  var x = xOutput.format(xr * 2);
+  var c = cOutput.format(cc);
+  var z = zOutput.format(_z);
+  if (x || c || z) {
+    if (pendingRadiusCompensation >= 0) {
+      error(localize("Radius compensation mode cannot be changed at rapid traversal."));
+      return;
+    }
+    writeBlock(gMotionModal.format(0), x, c, z, flushM960());
+  }
+}
+
+function onLinear5D(_x, _y, _z, _a, _b, _c, feed) {
+  if (!machineState.usePolarMode) {
+    error(localize("Multi-axis simultaneous toolpath is not supported by the post."));
+    return;
+  }
+  flushCoolant();
+  var xr = getModulus(_x, _y);
+  var cc = getCClosest(_x, _y, cOutput.getCurrent());
+  var x = xOutput.format(xr * 2);
+  var c = cOutput.format(cc);
+  var z = zOutput.format(_z);
+  if (x || c || z) {
+    var cOnly = !x && !z && c;
+    if (cOnly != machineState.feedIsDPM) {
+      forceFeed();
+      machineState.feedIsDPM = cOnly;
+    }
+    var rawFeed = (cOnly && xr > 0) ? feedOutput.format(feed * 180 / (Math.PI * xr)) : getFeed(feed);
+    var fm = rawFeed ? flushFeedMode() : undefined;
+    var f = (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+    if (pendingRadiusCompensation >= 0) {
+      pendingRadiusCompensation = -1;
+      switch (radiusCompensation) {
+      case RADIUS_COMPENSATION_LEFT:
+        writeBlock(gMotionModal.format(101), gFormat.format(41), x, c, z, f, flushM960());
+        break;
+      case RADIUS_COMPENSATION_RIGHT:
+        writeBlock(gMotionModal.format(101), gFormat.format(42), x, c, z, f, flushM960());
+        break;
+      default:
+        writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
+      }
+    } else {
+      writeBlock(gMotionModal.format(101), x, c, z, f, flushM960());
+    }
+  }
+}
+
 function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
+  flushCoolant();
   if (pendingRadiusCompensation >= 0) {
     error(localize("Radius compensation cannot be activated/deactivated for a circular move."));
     return;
@@ -845,57 +1263,245 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
     return;
   }
 
+  if (machineState.useCartesianPolar) {
+    var directionCode = clockwise ? 2 : 3;
+    if (isHelical()) {
+      if (!getProperty("optHelicalContour")) {
+        linearize(tolerance);
+        return;
+      }
+    }
+    if (isFullCircle()) {
+      linearize(tolerance);
+      return;
+    }
+    var start = getCurrentPosition();
+    xOutput.reset();
+    yOutput.reset();
+    if (getProperty("useRadius")) {
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        "L" + rFormat.format(getCircularRadius()),
+        getFeed(feed)
+      );
+    } else {
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        iOutput.format(cx - start.x, 0),
+        jOutput.format(cy - start.y, 0),
+        getFeed(feed)
+      );
+    }
+    return;
+  }
+
+  if (machineState.usePolarMode) {
+    if (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) {
+      if (isFullCircle() || isHelical()) {
+        linearize(tolerance);
+        return;
+      }
+      var start = getCurrentPosition();
+      var xrStart = getModulus(start.x, start.y);
+      var xrEnd = getModulus(x, y);
+      if (Math.abs(xrStart - xrEnd) > spatialFormat.getMinimumValue()) {
+        linearize(tolerance);
+        return;
+      }
+      var cc = getCClosest(x, y, cOutput.getCurrent());
+      cOutput.reset();
+      writeBlock(
+        gMotionModal.format(clockwise ? 132 : 133),
+        zOutput.format(z),
+        cOutput.format(cc),
+        "L" + rFormat.format(getCircularRadius()),
+        getFeed(feed)
+      );
+      return;
+    }
+    var directionCode = clockwise ? 102 : 103;
+    if (isHelical()) {
+      if (!getProperty("optHelicalContour")) {
+        linearize(tolerance);
+        return;
+      }
+    }
+    if (isFullCircle()) {
+      linearize(tolerance);
+      return;
+    }
+    if (machineState.feedIsDPM) {
+      forceFeed();
+      machineState.feedIsDPM = false;
+    }
+    var currentC = getCClosest(x, y, cOutput.getCurrent());
+    xOutput.reset();
+    cOutput.reset();
+    writeBlock(
+      gMotionModal.format(directionCode),
+      xOutput.format(getModulus(x, y) * 2),
+      cOutput.format(currentC),
+      zOutput.format(z),
+      "L" + rFormat.format(getCircularRadius()),
+      getFeed(feed)
+    );
+    return;
+  }
+
   var start = getCurrentPosition();
   var directionCode = clockwise ? 2 : 3;
+
+  if (isHelical()) {
+    if (machineState.liveToolIsActive && !getProperty("optHelicalContour")) {
+      linearize(tolerance);
+      return;
+    }
+  }
 
   if (isFullCircle()) {
     if (getProperty("useRadius")) {
       linearize(tolerance);
       return;
     }
-    zOutput.reset();
-    xOutput.reset();
-    writeBlock(
-      gPlaneModal.format(18),
-      gMotionModal.format(directionCode),
-      iOutput.format(cx - start.x),
-      kOutput.format(cz - start.z),
-      getFeed(feed)
-    );
+    switch (getCircularPlane()) {
+    case PLANE_ZX:
+      zOutput.reset();
+      xOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        iOutput.format(cx - start.x),
+        kOutput.format(cz - start.z),
+        getFeed(feed),
+        gPlaneModal.format(18)
+      );
+      break;
+    case PLANE_XY:
+      xOutput.reset();
+      yOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        iOutput.format(cx - start.x, 0),
+        jOutput.format(cy - start.y, 0),
+        getFeed(feed),
+        gPlaneModal.format(17)
+      );
+      break;
+    case PLANE_YZ:
+      yOutput.reset();
+      zOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        jOutput.format(cy - start.y, 0),
+        kOutput.format(cz - start.z, 0),
+        getFeed(feed),
+        gPlaneModal.format(19)
+      );
+      break;
+    default:
+      linearize(tolerance);
+    }
   } else if (getProperty("useRadius")) {
     var r = getCircularRadius();
     if (toDeg(getCircularSweep()) > (180 + 1e-9)) {
       linearize(tolerance);
       return;
     }
-    zOutput.reset();
-    xOutput.reset();
-    // Okuma uses L for arc radius (not R like Fanuc)
-    writeBlock(
-      gPlaneModal.format(18),
-      gMotionModal.format(directionCode),
-      xOutput.format(x),
-      zOutput.format(z),
-      "L" + rFormat.format(r),
-      getFeed(feed)
-    );
+    switch (getCircularPlane()) {
+    case PLANE_ZX:
+      zOutput.reset();
+      xOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        zOutput.format(z),
+        "L" + rFormat.format(r),
+        getFeed(feed),
+        gPlaneModal.format(18)
+      );
+      break;
+    case PLANE_XY:
+      xOutput.reset();
+      yOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        "L" + rFormat.format(r),
+        getFeed(feed),
+        gPlaneModal.format(17)
+      );
+      break;
+    case PLANE_YZ:
+      yOutput.reset();
+      zOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        "L" + rFormat.format(r),
+        getFeed(feed),
+        gPlaneModal.format(19)
+      );
+      break;
+    default:
+      linearize(tolerance);
+    }
   } else {
-    // I/K center-point format
-    zOutput.reset();
-    xOutput.reset();
-    writeBlock(
-      gPlaneModal.format(18),
-      gMotionModal.format(directionCode),
-      xOutput.format(x),
-      zOutput.format(z),
-      iOutput.format(cx - start.x),
-      kOutput.format(cz - start.z),
-      getFeed(feed)
-    );
+    switch (getCircularPlane()) {
+    case PLANE_ZX:
+      zOutput.reset();
+      xOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        zOutput.format(z),
+        iOutput.format(cx - start.x),
+        kOutput.format(cz - start.z),
+        getFeed(feed),
+        gPlaneModal.format(18)
+      );
+      break;
+    case PLANE_XY:
+      xOutput.reset();
+      yOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        iOutput.format(cx - start.x, 0),
+        jOutput.format(cy - start.y, 0),
+        getFeed(feed),
+        gPlaneModal.format(17)
+      );
+      break;
+    case PLANE_YZ:
+      yOutput.reset();
+      zOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(x),
+        yOutput.format(y),
+        zOutput.format(z),
+        jOutput.format(cy - start.y, 0),
+        kOutput.format(cz - start.z, 0),
+        getFeed(feed),
+        gPlaneModal.format(19)
+      );
+      break;
+    default:
+      linearize(tolerance);
+    }
   }
 }
-
-var saveShowSequenceNumbers;
 
 function onCyclePath() {
   saveShowSequenceNumbers = showSequenceNumbers;
@@ -971,6 +1577,7 @@ function writeDrillingCycle(cycleCode, x, z, params) {
 }
 
 function onCyclePoint(x, y, z) {
+  flushCoolant();
   switch (cycleType) {
   case "thread-turning":
     if (skipThreading) {
@@ -1021,6 +1628,7 @@ function onCyclePoint(x, y, z) {
         iOutput.format(cycle.incrementalX),
         numberOfThreads > 1 ? "Q" + numberOfThreads : "",
         feedOutput.format(cycle.pitch),
+        flushFeedMode(),
         mFormat.format(threadCuttingMode),
         mFormat.format(infeedModeCode)
       );
@@ -1077,30 +1685,40 @@ function onCyclePoint(x, y, z) {
   case "right-tapping":
   case "left-tapping":
     if (isFirstCyclePoint()) {
-      if (!machineState.liveToolIsActive) {
-        error(localize("Tapping requires a live tool. G77/G78 spindle tapping is float-tap only and is not supported by this post. Use a live tool holder for tapping operations."));
-        return;
-      }
       var reverseTap = tool.type == TOOL_TAP_LEFT_HAND;
-      writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
-        "D" + spatialFormat.format(cycle.depth + cycle.retract - cycle.stock),
-        getFeed(cycle.feedrate)
-      ]);
+      if (!machineState.liveToolIsActive) {
+        if (getProperty("warnSpindleTap")) {
+          warning(localize("Tapping with G77/G78 (main spindle float-tap). Feedrate override is locked to 100% during cycle. Disable 'Warn on spindle tapping' to suppress this warning."));
+        }
+        writeDrillingCycle(reverseTap ? 78 : 77, x, z, [
+          getFeed(cycle.feedrate)
+        ]);
+      } else {
+        writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
+          "D" + spatialFormat.format(cycle.depth + cycle.retract - cycle.stock),
+          getFeed(cycle.feedrate)
+        ]);
+      }
     }
     break;
 
   case "tapping-with-chip-breaking":
-    if (!machineState.liveToolIsActive) {
-      error(localize("Chip-breaking tapping requires a live tool. Spindle tapping is float-tap only and is not supported by this post."));
-      return;
-    }
     if (isFirstCyclePoint()) {
       var reverseTap = tool.type == TOOL_TAP_LEFT_HAND;
-      writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
-        "D" + spatialFormat.format(cycle.incrementalDepth),
-        "L" + spatialFormat.format(cycle.incrementalDepth),
-        getFeed(cycle.feedrate)
-      ]);
+      if (!machineState.liveToolIsActive) {
+        if (getProperty("warnSpindleTap")) {
+          warning(localize("Tapping with G77/G78 (main spindle float-tap). Chip-breaking is not available in this mode. Disable 'Warn on spindle tapping' to suppress this warning."));
+        }
+        writeDrillingCycle(reverseTap ? 78 : 77, x, z, [
+          getFeed(cycle.feedrate)
+        ]);
+      } else {
+        writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
+          "D" + spatialFormat.format(cycle.incrementalDepth),
+          "L" + spatialFormat.format(cycle.incrementalDepth),
+          getFeed(cycle.feedrate)
+        ]);
+      }
     }
     break;
 
@@ -1116,6 +1734,30 @@ function onCyclePoint(x, y, z) {
     }
     break;
 
+  case "fine-boring":
+    if (isFirstCyclePoint()) {
+      if (machineState.liveToolIsActive) {
+        var P = !cycle.dwell ? 0 : cycle.dwell;
+        var rapto = cycle.clearance - cycle.retract;
+        var shiftAmount = cycle.shift ? cycle.shift : 0;
+        xOutput.reset();
+        zOutput.reset();
+        gCycleModal.reset();
+        writeBlock(
+          gCycleModal.format(296),
+          xOutput.format(x),
+          zOutput.format(z),
+          conditional(rapto != 0, "K" + spatialFormat.format(rapto)),
+          getFeed(cycle.feedrate),
+          conditional(shiftAmount > 0, "HS=" + spatialFormat.format(shiftAmount)),
+          conditional(P > 0, eOutput.format(P))
+        );
+      } else {
+        expandCyclePoint(x, y, z);
+      }
+    }
+    break;
+
   default:
     expandCyclePoint(x, y, z);
   }
@@ -1123,24 +1765,7 @@ function onCyclePoint(x, y, z) {
 
 function onCycleEnd() {
   if (!cycleExpanded) {
-    switch (cycleType) {
-    case "drilling":
-    case "counter-boring":
-    case "deep-drilling":
-    case "chip-breaking":
-    case "tapping":
-    case "right-tapping":
-    case "left-tapping":
-    case "tapping-with-chip-breaking":
-    case "reaming":
-    case "boring":
-      // G0 cancels canned cycles on Okuma — no explicit G80/G180 needed for hole ops
-      gCycleModal.reset();
-      break;
-    default:
-      writeBlock(gCycleModal.format(machineState.liveToolIsActive ? 180 : 80));
-      break;
-    }
+    writeBlock(gCycleModal.format(machineState.liveToolIsActive ? 180 : 80));
     gMotionModal.reset();
   }
   skipThreading = false;
@@ -1178,7 +1803,7 @@ function onCommand(command) {
     writeBlock(mFormat.format(2));
     break;
   case COMMAND_STOP_SPINDLE:
-    writeBlock(mFormat.format(5));
+    writeBlock(mFormat.format(machineState.liveToolIsActive ? 12 : 5));
     forceSpindleSpeed = true;
     break;
   case COMMAND_ORIENTATE_SPINDLE:
@@ -1199,8 +1824,10 @@ function onCommand(command) {
   case COMMAND_DEACTIVATE_SPEED_FEED_SYNCHRONIZATION:
     break;
   case COMMAND_LOCK_MULTI_AXIS:
+    writeBlock(mFormat.format(147));
     break;
   case COMMAND_UNLOCK_MULTI_AXIS:
+    writeBlock(mFormat.format(146));
     break;
   case COMMAND_BREAK_CONTROL:
     break;
@@ -1219,6 +1846,24 @@ function onPassThrough(text) {
 }
 
 function onSectionEnd() {
+  if (machineState.usePolarMode) {
+    if (machineState.machiningDirection != MACHINING_DIRECTION_RADIAL) {
+      setPolarMode(false);
+    } else {
+      writeBlock(gFormat.format(136));
+      machineState.usePolarMode = false;
+      machineState.useCartesianPolar = false;
+      machineState.feedIsDPM = false;
+    }
+    writeBlock(mFormat.format(147));
+  }
+
+  if (machineState.liveToolIsActive && !machineState.isTurningOperation) {
+    writeBlock(mFormat.format(12));
+    sbOutput.reset();
+    machineState.liveToolIsActive = false;
+  }
+
   // Switch G96→G97 only at tool changes or program end — safe to stay in G96 between same-tool ops
   if (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED) {
     var needG97 = isLastSection();
@@ -1233,6 +1878,8 @@ function onSectionEnd() {
   }
 
   forceAny();
+  gPlaneModal.reset();
+  gFeedModeModal.reset();
   skipThreading = false;
 }
 
@@ -1256,54 +1903,3 @@ function onClose() {
   writeBlock(mFormat.format(30));
 }
 
-// coolant support
-var currentCoolantMode = COOLANT_OFF;
-
-function setCoolant(coolant) {
-  var coolantCodes = getCoolantCodes(coolant);
-  if (Array.isArray(coolantCodes)) {
-    for (var c in coolantCodes) {
-      writeBlock(coolantCodes[c]);
-    }
-    return undefined;
-  }
-  return coolantCodes;
-}
-
-function getCoolantCodes(coolant) {
-  if (coolant == currentCoolantMode && !forceCoolant) {
-    return undefined;
-  }
-  forceCoolant = false;
-
-  var m = [];
-  if (coolant == COOLANT_OFF) {
-    if (currentCoolantMode != COOLANT_OFF) {
-      m.push(mFormat.format(9));
-    }
-    currentCoolantMode = COOLANT_OFF;
-    return m;
-  }
-
-  if (currentCoolantMode != COOLANT_OFF) {
-    m.push(mFormat.format(9));
-  }
-
-  switch (coolant) {
-  case COOLANT_FLOOD:
-    m.push(mFormat.format(8));
-    break;
-  case COOLANT_THROUGH_TOOL:
-    m.push(mFormat.format(8));
-    break;
-  case COOLANT_MIST:
-    m.push(mFormat.format(8));
-    break;
-  default:
-    warning(localize("Coolant type not supported, using flood coolant."));
-    m.push(mFormat.format(8));
-  }
-
-  currentCoolantMode = coolant;
-  return m;
-}
