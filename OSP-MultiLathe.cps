@@ -184,18 +184,18 @@ properties = {
   },
   optHelicalMilling: {
     title      : "Helical Milling (X-Y-Z)",
-    description: "Enable helical interpolation milling in XYZ. Requires Type Y.",
+    description: "Output true helical G02/G03 arcs in XYZ milling. Disable to linearize into line segments. Requires Type Y.",
     group      : "Options",
     type       : "boolean",
-    value      : false,
+    value      : true,
     scope      : "post"
   },
   optHelicalContour: {
     title      : "Helical Contour (X-C-Z)",
-    description: "Enable helical contour interpolation in XCZ. Requires Type M.",
+    description: "Output true helical G102/G103 arcs in XCZ polar contour mode. Disable to linearize into line segments. Requires Type M.",
     group      : "Options",
     type       : "boolean",
-    value      : false,
+    value      : true,
     scope      : "post"
   },
   optWorkOffsets: {
@@ -220,6 +220,18 @@ properties = {
     group      : "Options",
     type       : "boolean",
     value      : true,
+    scope      : "post"
+  },
+  drillingRetractMode: {
+    title      : "Drilling retract mode",
+    description: "M-tool drilling cycle approach format. IK (standard): I for radial, K for axial approach distance. R: absolute retract position — verify machine support before use.",
+    group      : "preferences",
+    type       : "enum",
+    values     : [
+      {title:"IK (Standard)", id:"IK"},
+      {title:"R", id:"R"}
+    ],
+    value      : "IK",
     scope      : "post"
   },
   showNotes: {
@@ -328,6 +340,17 @@ var MACHINING_DIRECTION_AXIAL = 0;
 var MACHINING_DIRECTION_RADIAL = 1;
 var MACHINING_DIRECTION_INDEXING = 2;
 
+function isRadialDrillMode() {
+  return machineState.liveToolIsActive &&
+    !machineState.usePolarMode &&
+    (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL);
+}
+
+function toMachineCoords(_x, _y, _z) {
+  var global = currentSection.workPlane.multiply(new Vector(_x, _y, _z));
+  return {x: global.y / 2, z: global.z};
+}
+
 var machineState = {
   isTurningOperation  : undefined,
   liveToolIsActive    : false,
@@ -338,9 +361,13 @@ var machineState = {
   pendingFeedMode     : undefined,
   pendingCoolant      : undefined,
   usePolarMode        : false,
-  useCartesianPolar   : false,
   feedIsDPM           : false,
-  machiningDirection  : undefined
+  machiningDirection  : undefined,
+  isThreadMill        : false,
+  threadMillCompPending : false,
+  threadMillCompActive : false,
+  threadMillCompCode  : 42,
+  threadMillInHelix   : false
 };
 
 function hasLiveTooling() {
@@ -391,7 +418,39 @@ function getCClosest(x, y, _c) {
   if (c < 0) {
     c += Math.PI * 2;
   }
+  if (c > (Math.PI * 2 - 1e-4)) {
+    c -= Math.PI * 2;
+  }
   return c;
+}
+
+function toPolar(x, y) {
+  return {
+    xr: getModulus(x, y),
+    cc: getCClosest(x, y, cOutput.getCurrent())
+  };
+}
+
+function getPolarFeed(feed, xr, hasX, hasZ, hasC) {
+  var cOnly = !hasX && !hasZ && hasC;
+  if (cOnly != machineState.feedIsDPM) {
+    forceFeed();
+    machineState.feedIsDPM = cOnly;
+  }
+  var rawFeed = (cOnly && xr > 0) ? feedOutput.format(feed * 180 / (Math.PI * xr)) : getFeed(feed);
+  var fm = rawFeed ? flushFeedMode() : undefined;
+  return (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+}
+
+function flushPrePositionBuffer(cc) {
+  cOutput.reset();
+  writeBlock(gMotionModal.format(0), cOutput.format(cc));
+  for (var i = 0; i < machineState.prePositionBuffer.length; i++) {
+    writeln(machineState.prePositionBuffer[i]);
+  }
+  machineState.prePositionBuffer = [];
+  machineState.cPrePositionPending = false;
+  gMotionModal.reset();
 }
 
 function engageCAxis() {
@@ -436,20 +495,7 @@ function disengageCAxis() {
   }
 }
 
-function setPolarMode(activate) {
-  if (activate) {
-    writeBlock(gFormat.format(137));
-    machineState.usePolarMode = true;
-    machineState.useCartesianPolar = true;
-    gMotionModal.reset();
-  } else {
-    writeBlock(gFormat.format(136));
-    machineState.usePolarMode = false;
-    machineState.useCartesianPolar = false;
-    machineState.feedIsDPM = false;
-    gPlaneModal.reset();
-  }
-}
+
 
 function validateMachineConfig() {
   if (getProperty("type2_Y") && !getProperty("type1_M") && !getProperty("type4_Multus")) {
@@ -801,6 +847,7 @@ function onSection() {
   machineState.isTurningOperation = (currentSection.getType() == TYPE_TURNING);
   machineState.liveToolIsActive = false;
   machineState.usePolarMode = false;
+  machineState.cPrePositionPending = false;
   machineState.machiningDirection = undefined;
 
   if (!machineState.isTurningOperation) {
@@ -856,6 +903,22 @@ function onSection() {
     }
   }
 
+  machineState.threadMill = {
+    active: false,
+    compPending: false,
+    compActive: false,
+    compCode: 41,
+    compDeferred: false,
+    bufferedArgs: undefined,
+    inHelix: false
+  };
+  if (!machineState.isTurningOperation &&
+      hasParameter("operation:cycleType") &&
+      getParameter("operation:cycleType") == "thread-milling") {
+    machineState.threadMill.active = true;
+    machineState.threadMill.compPending = true;
+  }
+
   tapping = isTappingCycle();
 
   var forceSectionRestart = optionalSection && !currentSection.isOptional();
@@ -905,6 +968,19 @@ function onSection() {
     }
   }
 
+  machineState.compensationType = hasParameter("operation:compensationType") ? getParameter("operation:compensationType") : "computer";
+
+  if (machineState.threadMill.active) {
+    warning(localize("Thread mill: cutter comp enabled, format is WEAR (tool center). Set Nose-R to zero for this tool."));
+    writeComment("CUTTER COMP WEAR TYPE - SET NOSE-R TO ZERO");
+  } else if (machineState.compensationType == "control") {
+    writeComment("CUTTER COMP CONTROL TYPE");
+  } else if (machineState.compensationType == "wear") {
+    writeComment("CUTTER COMP WEAR TYPE");
+  } else if (machineState.compensationType == "inverseWear") {
+    writeComment("CUTTER COMP REVERSE WEAR TYPE - DIRECTION FLIPPED");
+  }
+
   // Feed mode — defer to first feed line
   if (insertToolCall) {
     forceModals();
@@ -952,12 +1028,7 @@ function onSection() {
     if (compensationOffset == 0) {
       compensationOffset = tool.number;
     }
-    var toolCall;
-    if (tool.isTurningTool()) {
-      toolCall = "T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset);
-    } else {
-      toolCall = "T" + toolFormat.format(tool.number * 100 + compensationOffset);
-    }
+    var toolCall = "T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset);
     writeBlock(toolCall);
 
     if (tool.comment) {
@@ -1000,7 +1071,8 @@ function onSection() {
       cOutput.reset();
       gMotionModal.reset();
     } else {
-      setPolarMode(true);
+      machineState.pendingM960 = true;
+      gMotionModal.reset();
     }
   }
 
@@ -1009,16 +1081,21 @@ function onSection() {
   gMotionModal.reset();
 
   var initialPosition = getFramePosition(currentSection.getInitialPosition());
-  if (machineState.useCartesianPolar) {
-    xOutput.reset();
-    yOutput.reset();
+  if (machineState.usePolarMode) {
+    var polar = toPolar(initialPosition.x, initialPosition.y);
     writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
-    writeBlock(gMotionModal.format(0), xOutput.format(initialPosition.x), yOutput.format(initialPosition.y));
-  } else if (machineState.usePolarMode) {
-    var cx = getModulus(initialPosition.x, initialPosition.y);
-    var cc = getCClosest(initialPosition.x, initialPosition.y, cOutput.getCurrent());
-    writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
-    writeBlock(gMotionModal.format(0), xOutput.format(cx * 2), cOutput.format(cc), flushM960());
+    if (xFormat.isSignificant(polar.xr)) {
+      writeBlock(gMotionModal.format(0), xOutput.format(polar.xr), cOutput.format(polar.cc), flushM960());
+    } else {
+      writeBlock(gMotionModal.format(0), xOutput.format(polar.xr), flushM960());
+      machineState.cPrePositionPending = true;
+      machineState.prePositionBuffer = [];
+    }
+  } else if (isRadialDrillMode()) {
+    var mach = toMachineCoords(initialPosition.x, initialPosition.y, initialPosition.z);
+    gMotionModal.reset();
+    writeBlock(gMotionModal.format(0), xOutput.format(mach.x));
+    writeBlock(gMotionModal.format(0), zOutput.format(mach.z));
   } else if (insertToolCall || (tool.getSpindleMode() == SPINDLE_CONSTANT_SURFACE_SPEED)) {
     gMotionModal.reset();
     writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
@@ -1041,43 +1118,65 @@ function onDwell(seconds) {
 }
 
 function onRadiusCompensation() {
-  pendingRadiusCompensation = radiusCompensation;
+  var comp = radiusCompensation;
+  if (machineState.compensationType == "inverseWear") {
+    if (comp == RADIUS_COMPENSATION_LEFT) {
+      comp = RADIUS_COMPENSATION_RIGHT;
+    } else if (comp == RADIUS_COMPENSATION_RIGHT) {
+      comp = RADIUS_COMPENSATION_LEFT;
+    }
+  }
+  pendingRadiusCompensation = comp;
 }
 
 function onRapid(_x, _y, _z) {
-  if (machineState.useCartesianPolar) {
-    // G137 alarm 2259: both X and Y must always be specified
-    xOutput.reset();
-    yOutput.reset();
-    var x = xOutput.format(_x);
-    var y = yOutput.format(_y);
-    var z = zOutput.format(_z);
-    if (x || y || z) {
-      if (pendingRadiusCompensation >= 0) {
-        error(localize("Radius compensation mode cannot be changed at rapid traversal."));
-        return;
-      }
-      writeBlock(gMotionModal.format(0), x, y, z);
-    }
-    return;
-  }
-
   if (machineState.usePolarMode) {
-    var xr = getModulus(_x, _y);
-    var cc = getCClosest(_x, _y, cOutput.getCurrent());
-    var x = xOutput.format(xr * 2);
-    var c = cOutput.format(cc);
+    var polar = toPolar(_x, _y);
+    if (machineState.cPrePositionPending) {
+      if (xFormat.isSignificant(polar.xr)) {
+        flushPrePositionBuffer(polar.cc);
+        var x = xOutput.format(polar.xr);
+        var z = zOutput.format(_z);
+        if (x || z) {
+          writeBlock(gMotionModal.format(0), x, z, flushM960());
+        }
+      } else {
+        var x = xOutput.format(polar.xr);
+        var z = zOutput.format(_z);
+        if (x || z) {
+          var text = formatWords(gMotionModal.format(0), x, z, flushM960());
+          if (text) {
+            machineState.prePositionBuffer.push(text);
+          }
+        }
+      }
+      return;
+    }
+    var x = xOutput.format(polar.xr);
+    var c = cOutput.format(polar.cc);
     var z = zOutput.format(_z);
     if (x || c || z) {
       if (pendingRadiusCompensation >= 0) {
         error(localize("Radius compensation mode cannot be changed at rapid traversal."));
         return;
       }
+      var tm = machineState.threadMill;
+      if (tm.compActive) {
+        writeBlock(gFormat.format(40));
+        tm.compActive = false;
+        tm.inHelix = false;
+        tm.compPending = true;
+      }
       writeBlock(gMotionModal.format(0), x, c, z, flushM960());
     }
     return;
   }
 
+  if (isRadialDrillMode()) {
+    var mach = toMachineCoords(_x, _y, _z);
+    _x = mach.x;
+    _z = mach.z;
+  }
   var x = xOutput.format(_x);
   var z = zOutput.format(_z);
   if (x || z) {
@@ -1111,61 +1210,57 @@ function onLinear(_x, _y, _z, feed) {
     return;
   }
 
-  if (machineState.useCartesianPolar) {
-    // G137 alarm 2259: both X and Y must always be specified
-    xOutput.reset();
-    yOutput.reset();
-    var x = xOutput.format(_x);
-    var y = yOutput.format(_y);
-    var z = zOutput.format(_z);
-    if (x || y || z) {
-      var f = getFeed(feed);
-      if (pendingRadiusCompensation >= 0) {
-        pendingRadiusCompensation = -1;
-        switch (radiusCompensation) {
-        case RADIUS_COMPENSATION_LEFT:
-          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, f);
-          break;
-        case RADIUS_COMPENSATION_RIGHT:
-          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, f);
-          break;
-        default:
-          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, f);
-        }
+  if (machineState.usePolarMode) {
+    var polar = toPolar(_x, _y);
+    if (machineState.cPrePositionPending) {
+      if (xFormat.isSignificant(polar.xr)) {
+        flushPrePositionBuffer(polar.cc);
       } else {
-        writeBlock(gMotionModal.format(1), x, y, z, f);
+        var x = xOutput.format(polar.xr);
+        var z = zOutput.format(_z);
+        if (x || z) {
+          var rawFeed = getFeed(feed);
+          var fm = rawFeed ? flushFeedMode() : undefined;
+          var f = (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+          var text = formatWords(gMotionModal.format(101), x, z, f, flushM960());
+          if (text) {
+            machineState.prePositionBuffer.push(text);
+          }
+        }
+        return;
       }
     }
-    return;
-  }
-
-  if (machineState.usePolarMode) {
-    var xr = getModulus(_x, _y);
-    var cc = getCClosest(_x, _y, cOutput.getCurrent());
-    var x = xOutput.format(xr * 2);
-    var c = cOutput.format(cc);
+    var x = xOutput.format(polar.xr);
+    var c = cOutput.format(polar.cc);
     var z = zOutput.format(_z);
     if (x || c || z) {
-      var cOnly = !x && !z && c;
-      if (cOnly != machineState.feedIsDPM) {
-        forceFeed();
-        machineState.feedIsDPM = cOnly;
-      }
-      var rawFeed = (cOnly && xr > 0) ? feedOutput.format(feed * 180 / (Math.PI * xr)) : getFeed(feed);
-      var fm = rawFeed ? flushFeedMode() : undefined;
-      var f = (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+      var f = getPolarFeed(feed, polar.xr, x, z, c);
       if (pendingRadiusCompensation >= 0) {
+        var effectiveComp = pendingRadiusCompensation;
         pendingRadiusCompensation = -1;
-        switch (radiusCompensation) {
+        switch (effectiveComp) {
         case RADIUS_COMPENSATION_LEFT:
-          writeBlock(gMotionModal.format(101), gFormat.format(41), x, c, z, f, flushM960());
+          writeBlock(gMotionModal.format(101), gFormat.format(17), gFormat.format(41), x, c, z, f, flushM960());
           break;
         case RADIUS_COMPENSATION_RIGHT:
-          writeBlock(gMotionModal.format(101), gFormat.format(42), x, c, z, f, flushM960());
+          writeBlock(gMotionModal.format(101), gFormat.format(17), gFormat.format(42), x, c, z, f, flushM960());
           break;
         default:
           writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
         }
+      } else if (machineState.threadMill.compPending && !z && (x || c)) {
+        var tm = machineState.threadMill;
+        tm.compPending = false;
+        tm.compDeferred = true;
+        tm.bufferedArgs = {
+          motion: gMotionModal.format(101), x: x, c: c, z: z, f: f, m960: flushM960()
+        };
+      } else if (machineState.threadMill.compActive && machineState.threadMill.inHelix) {
+        var tm = machineState.threadMill;
+        tm.compActive = false;
+        tm.inHelix = false;
+        tm.compPending = true;
+        writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
       } else {
         writeBlock(gMotionModal.format(101), x, c, z, f, flushM960());
       }
@@ -1173,12 +1268,18 @@ function onLinear(_x, _y, _z, feed) {
     return;
   }
 
+  if (isRadialDrillMode()) {
+    var mach = toMachineCoords(_x, _y, _z);
+    _x = mach.x;
+    _z = mach.z;
+  }
   var x = xOutput.format(_x);
   var z = zOutput.format(_z);
   if (x || z) {
     if (pendingRadiusCompensation >= 0) {
+      var effectiveComp = pendingRadiusCompensation;
       pendingRadiusCompensation = -1;
-      switch (radiusCompensation) {
+      switch (effectiveComp) {
       case RADIUS_COMPENSATION_LEFT:
         writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, getFeed(feed), gPlaneModal.format(18));
         break;
@@ -1199,10 +1300,9 @@ function onRapid5D(_x, _y, _z, _a, _b, _c) {
     error(localize("Multi-axis simultaneous toolpath is not supported by the post."));
     return;
   }
-  var xr = getModulus(_x, _y);
-  var cc = getCClosest(_x, _y, cOutput.getCurrent());
-  var x = xOutput.format(xr * 2);
-  var c = cOutput.format(cc);
+  var polar = toPolar(_x, _y);
+  var x = xOutput.format(polar.xr);
+  var c = cOutput.format(polar.cc);
   var z = zOutput.format(_z);
   if (x || c || z) {
     if (pendingRadiusCompensation >= 0) {
@@ -1219,28 +1319,21 @@ function onLinear5D(_x, _y, _z, _a, _b, _c, feed) {
     return;
   }
   flushCoolant();
-  var xr = getModulus(_x, _y);
-  var cc = getCClosest(_x, _y, cOutput.getCurrent());
-  var x = xOutput.format(xr * 2);
-  var c = cOutput.format(cc);
+  var polar = toPolar(_x, _y);
+  var x = xOutput.format(polar.xr);
+  var c = cOutput.format(polar.cc);
   var z = zOutput.format(_z);
   if (x || c || z) {
-    var cOnly = !x && !z && c;
-    if (cOnly != machineState.feedIsDPM) {
-      forceFeed();
-      machineState.feedIsDPM = cOnly;
-    }
-    var rawFeed = (cOnly && xr > 0) ? feedOutput.format(feed * 180 / (Math.PI * xr)) : getFeed(feed);
-    var fm = rawFeed ? flushFeedMode() : undefined;
-    var f = (rawFeed && fm) ? (rawFeed + " " + fm) : rawFeed;
+    var f = getPolarFeed(feed, polar.xr, x, z, c);
     if (pendingRadiusCompensation >= 0) {
+      var effectiveComp = pendingRadiusCompensation;
       pendingRadiusCompensation = -1;
-      switch (radiusCompensation) {
+      switch (effectiveComp) {
       case RADIUS_COMPENSATION_LEFT:
-        writeBlock(gMotionModal.format(101), gFormat.format(41), x, c, z, f, flushM960());
+        writeBlock(gMotionModal.format(101), gFormat.format(17), gFormat.format(41), x, c, z, f, flushM960());
         break;
       case RADIUS_COMPENSATION_RIGHT:
-        writeBlock(gMotionModal.format(101), gFormat.format(42), x, c, z, f, flushM960());
+        writeBlock(gMotionModal.format(101), gFormat.format(17), gFormat.format(42), x, c, z, f, flushM960());
         break;
       default:
         writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
@@ -1263,47 +1356,9 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
     return;
   }
 
-  if (machineState.useCartesianPolar) {
-    var directionCode = clockwise ? 2 : 3;
-    if (isHelical()) {
-      if (!getProperty("optHelicalContour")) {
-        linearize(tolerance);
-        return;
-      }
-    }
-    if (isFullCircle()) {
-      linearize(tolerance);
-      return;
-    }
-    var start = getCurrentPosition();
-    xOutput.reset();
-    yOutput.reset();
-    if (getProperty("useRadius")) {
-      writeBlock(
-        gMotionModal.format(directionCode),
-        xOutput.format(x),
-        yOutput.format(y),
-        zOutput.format(z),
-        "L" + rFormat.format(getCircularRadius()),
-        getFeed(feed)
-      );
-    } else {
-      writeBlock(
-        gMotionModal.format(directionCode),
-        xOutput.format(x),
-        yOutput.format(y),
-        zOutput.format(z),
-        iOutput.format(cx - start.x, 0),
-        jOutput.format(cy - start.y, 0),
-        getFeed(feed)
-      );
-    }
-    return;
-  }
-
   if (machineState.usePolarMode) {
     if (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) {
-      if (isFullCircle() || isHelical()) {
+      if (isHelical()) {
         linearize(tolerance);
         return;
       }
@@ -1312,6 +1367,44 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
       var xrEnd = getModulus(x, y);
       if (Math.abs(xrStart - xrEnd) > spatialFormat.getMinimumValue()) {
         linearize(tolerance);
+        return;
+      }
+      if (isFullCircle() || toDeg(getCircularSweep()) > (180 + 1e-9)) {
+        var r = getCircularRadius();
+        var sweep = getCircularSweep();
+        var rPart = xrStart;
+        var cStart = getCClosest(start.x, start.y, cOutput.getCurrent());
+        var cCenter = Math.atan2(cy, cx);
+        if (cCenter < 0) { cCenter += Math.PI * 2; }
+        var dZ = start.z - cz;
+        var dC = cStart - cCenter;
+        while (dC > Math.PI) { dC -= Math.PI * 2; }
+        while (dC < -Math.PI) { dC += Math.PI * 2; }
+        var dS = rPart * dC;
+        var startAngle = Math.atan2(dS, dZ);
+        var midAngle = clockwise ? (startAngle - Math.PI) : (startAngle + Math.PI);
+        var midZ = cz + r * Math.cos(midAngle);
+        var midCRad = cCenter + r * Math.sin(midAngle) / rPart;
+        var midCartX = rPart * Math.cos(midCRad);
+        var midCartY = rPart * Math.sin(midCRad);
+        var midC = getCClosest(midCartX, midCartY, cOutput.getCurrent());
+        cOutput.reset();
+        writeBlock(
+          gMotionModal.format(clockwise ? 132 : 133),
+          zOutput.format(midZ),
+          cOutput.format(midC),
+          "L" + rFormat.format(r),
+          getFeed(feed)
+        );
+        var endC = getCClosest(x, y, midC);
+        cOutput.reset();
+        writeBlock(
+          gMotionModal.format(clockwise ? 132 : 133),
+          zOutput.format(z),
+          cOutput.format(endC),
+          "L" + rFormat.format(r),
+          getFeed(feed)
+        );
         return;
       }
       var cc = getCClosest(x, y, cOutput.getCurrent());
@@ -1326,27 +1419,73 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
       return;
     }
     var directionCode = clockwise ? 102 : 103;
+    var arcStart = getCurrentPosition();
+    if (!xFormat.isSignificant(getModulus(arcStart.x, arcStart.y)) || !xFormat.isSignificant(getModulus(x, y))) {
+      linearize(tolerance);
+      return;
+    }
     if (isHelical()) {
       if (!getProperty("optHelicalContour")) {
         linearize(tolerance);
         return;
       }
     }
-    if (isFullCircle()) {
-      linearize(tolerance);
-      return;
-    }
     if (machineState.feedIsDPM) {
       forceFeed();
       machineState.feedIsDPM = false;
     }
-    var currentC = getCClosest(x, y, cOutput.getCurrent());
+    if (machineState.threadMill.active) {
+      var tm = machineState.threadMill;
+      if (tm.compDeferred) {
+        tm.compCode = clockwise ? 42 : 41;
+        var buf = tm.bufferedArgs;
+        writeBlock(buf.motion, gFormat.format(17), gFormat.format(tm.compCode), buf.x, buf.c, buf.z, buf.f, buf.m960);
+        tm.compDeferred = false;
+        tm.compActive = true;
+        tm.bufferedArgs = undefined;
+      }
+      tm.inHelix = true;
+    }
+    if (isFullCircle() || toDeg(getCircularSweep()) > (180 + 1e-9)) {
+      var start = getCurrentPosition();
+      var r = getCircularRadius();
+      var sweep = getCircularSweep();
+      var startAngle = Math.atan2(start.y - cy, start.x - cx);
+      var midAngle = clockwise ? (startAngle - Math.PI) : (startAngle + Math.PI);
+      var midX = cx + r * Math.cos(midAngle);
+      var midY = cy + r * Math.sin(midAngle);
+      var midZ = start.z + (z - start.z) * (Math.PI / sweep);
+      var midPolar = toPolar(midX, midY);
+      xOutput.reset();
+      cOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(midPolar.xr),
+        cOutput.format(midPolar.cc),
+        zOutput.format(midZ),
+        "L" + rFormat.format(r),
+        getFeed(feed)
+      );
+      var endC = getCClosest(x, y, midPolar.cc);
+      xOutput.reset();
+      cOutput.reset();
+      writeBlock(
+        gMotionModal.format(directionCode),
+        xOutput.format(getModulus(x, y)),
+        cOutput.format(endC),
+        zOutput.format(z),
+        "L" + rFormat.format(r),
+        getFeed(feed)
+      );
+      return;
+    }
+    var polar = toPolar(x, y);
     xOutput.reset();
     cOutput.reset();
     writeBlock(
       gMotionModal.format(directionCode),
-      xOutput.format(getModulus(x, y) * 2),
-      cOutput.format(currentC),
+      xOutput.format(polar.xr),
+      cOutput.format(polar.cc),
       zOutput.format(z),
       "L" + rFormat.format(getCircularRadius()),
       getFeed(feed)
@@ -1358,7 +1497,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
   var directionCode = clockwise ? 2 : 3;
 
   if (isHelical()) {
-    if (machineState.liveToolIsActive && !getProperty("optHelicalContour")) {
+    if (machineState.liveToolIsActive && !getProperty("optHelicalMilling")) {
       linearize(tolerance);
       return;
     }
@@ -1561,23 +1700,58 @@ function onCycle() {
 }
 
 function writeDrillingCycle(cycleCode, x, z, params) {
-  var rapto = cycle.clearance - cycle.retract;
+  var isLive = machineState.liveToolIsActive;
+  var isRadial = isLive && (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL);
+
   xOutput.reset();
   zOutput.reset();
-  var words = [
-    gCycleModal.format(cycleCode),
-    xOutput.format(x),
-    zOutput.format(z),
-    conditional(rapto != 0, "K" + spatialFormat.format(rapto))
-  ];
-  for (var i = 0; i < params.length; ++i) {
-    words.push(params[i]);
+
+  if (isLive && getProperty("drillingRetractMode") == "R") {
+    var rPos = cycle.retract;
+    if (isRadial) {
+      rPos = rPos * 2;
+    }
+    if (rPos == 0) {
+      error(localize("Drilling R mode: R=0 causes Okuma alarm 2266. Check cycle heights."));
+      return;
+    }
+    var words = [
+      gCycleModal.format(cycleCode),
+      "R" + spatialFormat.format(rPos)
+    ];
+    for (var i = 0; i < params.length; ++i) {
+      words.push(params[i]);
+    }
+    writeBlock.apply(null, words);
+  } else {
+    if (isRadial) {
+      writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
+      var rapto = cycle.clearance - cycle.retract;
+      var approachLetter = "I";
+    } else {
+      var rapto = getCurrentPosition().z - cycle.retract;
+      var approachLetter = "K";
+    }
+    var words = [
+      gCycleModal.format(cycleCode),
+      xOutput.format(x),
+      zOutput.format(z),
+      conditional(rapto != 0, approachLetter + spatialFormat.format(rapto))
+    ];
+    for (var i = 0; i < params.length; ++i) {
+      words.push(params[i]);
+    }
+    writeBlock.apply(null, words);
   }
-  writeBlock.apply(null, words);
 }
 
 function onCyclePoint(x, y, z) {
   flushCoolant();
+  if (isRadialDrillMode()) {
+    var mach = toMachineCoords(x, y, z);
+    x = mach.x;
+    z = mach.z;
+  }
   switch (cycleType) {
   case "thread-turning":
     if (skipThreading) {
@@ -1738,7 +1912,14 @@ function onCyclePoint(x, y, z) {
     if (isFirstCyclePoint()) {
       if (machineState.liveToolIsActive) {
         var P = !cycle.dwell ? 0 : cycle.dwell;
-        var rapto = cycle.clearance - cycle.retract;
+        var isRadialBore = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL);
+        var boreLetter = isRadialBore ? "I" : "K";
+        if (isRadialBore) {
+          writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
+          var rapto = cycle.clearance - cycle.retract;
+        } else {
+          var rapto = getCurrentPosition().z - cycle.retract;
+        }
         var shiftAmount = cycle.shift ? cycle.shift : 0;
         xOutput.reset();
         zOutput.reset();
@@ -1747,7 +1928,7 @@ function onCyclePoint(x, y, z) {
           gCycleModal.format(296),
           xOutput.format(x),
           zOutput.format(z),
-          conditional(rapto != 0, "K" + spatialFormat.format(rapto)),
+          conditional(rapto != 0, boreLetter + spatialFormat.format(rapto)),
           getFeed(cycle.feedrate),
           conditional(shiftAmount > 0, "HS=" + spatialFormat.format(shiftAmount)),
           conditional(P > 0, eOutput.format(P))
@@ -1758,16 +1939,122 @@ function onCyclePoint(x, y, z) {
     }
     break;
 
+  case "stop-boring": {
+    var P = !cycle.dwell ? 0 : cycle.dwell;
+    var stopCode = machineState.liveToolIsActive ? 12 : 5;
+    var startCode = machineState.liveToolIsActive ?
+      (tool.clockwise ? 13 : 14) : (tool.clockwise ? 3 : 4);
+    var isRadialBore = isRadialDrillMode();
+
+    if (!isFirstCyclePoint()) {
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+    }
+    if (isRadialBore) {
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(cycle.retract / 2));
+      gMotionModal.reset();
+      xOutput.reset();
+      writeBlock(gMotionModal.format(1), xOutput.format(x), getFeed(cycle.feedrate));
+    } else {
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(cycle.retract));
+      gMotionModal.reset();
+      zOutput.reset();
+      writeBlock(gMotionModal.format(1), zOutput.format(z), getFeed(cycle.feedrate));
+    }
+    if (P > 0) {
+      writeBlock(gFormat.format(4), eOutput.format(P));
+    }
+    writeBlock(mFormat.format(stopCode));
+    gMotionModal.reset();
+    if (isRadialBore) {
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
+    } else {
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(cycle.clearance));
+    }
+    writeBlock(mFormat.format(startCode));
+    machineState.customCycleExpanded = true;
+    break;
+  }
+
+  case "back-boring": {
+    var P = !cycle.dwell ? 0 : cycle.dwell;
+    var startCode = machineState.liveToolIsActive ?
+      (tool.clockwise ? 13 : 14) : (tool.clockwise ? 3 : 4);
+    var isRadialBore = isRadialDrillMode();
+    var shiftX = x + cycle.shift;
+
+    if (!isFirstCyclePoint()) {
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+    }
+    if (isRadialBore) {
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
+      writeBlock(mFormat.format(19));
+      writeBlock(gMotionModal.format(0), zOutput.format(shiftX));
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+      writeBlock(gMotionModal.format(0), zOutput.format(z));
+      writeBlock(mFormat.format(startCode));
+      gMotionModal.reset();
+      xOutput.reset();
+      writeBlock(gMotionModal.format(1), xOutput.format(x + cycle.backBoreDistance), getFeed(cycle.feedrate));
+      if (P > 0) {
+        writeBlock(gFormat.format(4), eOutput.format(P));
+      }
+      writeBlock(mFormat.format(19));
+      gMotionModal.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(shiftX));
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+      writeBlock(mFormat.format(startCode));
+    } else {
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(cycle.clearance));
+      writeBlock(mFormat.format(19));
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(shiftX));
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(z));
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+      writeBlock(mFormat.format(startCode));
+      gMotionModal.reset();
+      zOutput.reset();
+      writeBlock(gMotionModal.format(1), zOutput.format(z + cycle.backBoreDistance), getFeed(cycle.feedrate));
+      if (P > 0) {
+        writeBlock(gFormat.format(4), eOutput.format(P));
+      }
+      writeBlock(mFormat.format(19));
+      gMotionModal.reset();
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(shiftX));
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(cycle.clearance));
+      xOutput.reset();
+      writeBlock(gMotionModal.format(0), xOutput.format(x));
+      writeBlock(mFormat.format(startCode));
+    }
+    machineState.customCycleExpanded = true;
+    break;
+  }
+
   default:
     expandCyclePoint(x, y, z);
   }
 }
 
 function onCycleEnd() {
-  if (!cycleExpanded) {
+  if (!cycleExpanded && !machineState.customCycleExpanded) {
     writeBlock(gCycleModal.format(machineState.liveToolIsActive ? 180 : 80));
     gMotionModal.reset();
   }
+  machineState.customCycleExpanded = false;
   skipThreading = false;
 }
 
@@ -1814,10 +2101,10 @@ function onCommand(command) {
     onCommand(tool.clockwise ? COMMAND_SPINDLE_CLOCKWISE : COMMAND_SPINDLE_COUNTERCLOCKWISE);
     return;
   case COMMAND_SPINDLE_CLOCKWISE:
-    writeBlock(mFormat.format(3));
+    writeBlock(mFormat.format(machineState.liveToolIsActive ? 13 : 3));
     break;
   case COMMAND_SPINDLE_COUNTERCLOCKWISE:
-    writeBlock(mFormat.format(4));
+    writeBlock(mFormat.format(machineState.liveToolIsActive ? 14 : 4));
     break;
   case COMMAND_ACTIVATE_SPEED_FEED_SYNCHRONIZATION:
     break;
@@ -1846,15 +2133,16 @@ function onPassThrough(text) {
 }
 
 function onSectionEnd() {
+  if (machineState.threadMill.compActive) {
+    writeBlock(gFormat.format(40));
+    machineState.threadMill.compActive = false;
+  }
+
   if (machineState.usePolarMode) {
-    if (machineState.machiningDirection != MACHINING_DIRECTION_RADIAL) {
-      setPolarMode(false);
-    } else {
-      writeBlock(gFormat.format(136));
-      machineState.usePolarMode = false;
-      machineState.useCartesianPolar = false;
-      machineState.feedIsDPM = false;
-    }
+    machineState.usePolarMode = false;
+    machineState.feedIsDPM = false;
+    gMotionModal.reset();
+    gPlaneModal.reset();
     writeBlock(mFormat.format(147));
   }
 
