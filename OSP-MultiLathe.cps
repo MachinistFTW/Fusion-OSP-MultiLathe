@@ -70,9 +70,9 @@ properties = {
     value      : false,
     scope      : "post"
   },
-  type4_Multus: {
-    title      : "Type Multus — Multi-tasking",
-    description: "Enable if your machine is an Okuma Multus. Uses ATC tool change format (TD command).",
+  type4_TD: {
+    title      : "Type TD — ATC Tool Change",
+    description: "Enable for machines using TD tool change format (ATC magazine). Includes Okuma Multus and other multi-tasking machines.",
     group      : "Machine Type",
     type       : "boolean",
     value      : false,
@@ -371,19 +371,19 @@ var machineState = {
 };
 
 function hasLiveTooling() {
-  return getProperty("type1_M") || getProperty("type4_Multus");
+  return getProperty("type1_M") || getProperty("type4_TD");
 }
 
 function hasYAxis() {
-  return getProperty("type2_Y") || getProperty("type4_Multus");
+  return getProperty("type2_Y") || getProperty("type4_TD");
 }
 
 function hasSubSpindle() {
   return getProperty("type3_W");
 }
 
-function isMultus() {
-  return getProperty("type4_Multus");
+function isTD() {
+  return getProperty("type4_TD");
 }
 
 function getMaxSpindleSpeed() {
@@ -498,7 +498,7 @@ function disengageCAxis() {
 
 
 function validateMachineConfig() {
-  if (getProperty("type2_Y") && !getProperty("type1_M") && !getProperty("type4_Multus")) {
+  if (getProperty("type2_Y") && !getProperty("type1_M") && !getProperty("type4_TD")) {
     error(localize("Type Y (Y-axis) requires Type M (live tooling). Enable Type M or disable Type Y."));
   }
 }
@@ -857,7 +857,7 @@ function onSection() {
     if (!currentSection.isMultiAxis() && isDrillingCycle()) {
       if (toolIsLive) {
         if (!hasLiveTooling()) {
-          error(localize("Live tool drilling requires live tooling. Enable the 'Type M' or 'Type Multus' property."));
+          error(localize("Live tool drilling requires live tooling. Enable the 'Type M' or 'Type TD' property."));
           return;
         }
         machineState.liveToolIsActive = true;
@@ -866,7 +866,7 @@ function onSection() {
       var isWrapped = currentSection.polarMode != undefined && currentSection.polarMode != POLAR_MODE_OFF;
       if (isWrapped) {
         if (!hasLiveTooling()) {
-          error(localize("Wrapped milling requires live tooling. Enable the 'Type M' or 'Type Multus' property."));
+          error(localize("Wrapped milling requires live tooling. Enable the 'Type M' or 'Type TD' property."));
           return;
         }
         machineState.liveToolIsActive = true;
@@ -877,7 +877,7 @@ function onSection() {
       }
     } else if (currentSection.getType() == TYPE_MILLING) {
       if (!hasLiveTooling()) {
-        error(localize("Milling operations require live tooling. Enable the 'Type M' or 'Type Multus' property."));
+        error(localize("Milling operations require live tooling. Enable the 'Type M' or 'Type TD' property."));
         return;
       }
       machineState.liveToolIsActive = true;
