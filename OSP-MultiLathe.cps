@@ -295,6 +295,7 @@ var cFormat = createFormat({decimals:3, type:FORMAT_REAL, scale:DEG});
 
 // output variables
 var xOutput = createOutputVariable({prefix:"X"}, xFormat);
+var xMillOutput = createOutputVariable({prefix:"X"}, spatialFormat); // G272 radial mode — no diameter doubling
 var yOutput = createOutputVariable({prefix:"Y"}, yFormat);
 var zOutput = createOutputVariable({prefix:"Z"}, zFormat);
 var cOutput = createOutputVariable({prefix:"C"}, cFormat);
@@ -335,6 +336,8 @@ var forceCoolant = false;
 var skipThreading = false;
 var pendingRadiusCompensation = -1;
 var saveShowSequenceNumbers;
+var forceYAxisMode = false;
+var forceCAxisMode = false;
 
 var MACHINING_DIRECTION_AXIAL = 0;
 var MACHINING_DIRECTION_RADIAL = 1;
@@ -357,12 +360,15 @@ var machineState = {
   feedPerRevolution   : undefined,
   currentSpindle      : 0,
   cAxisIsEngaged      : false,
+  yAxisIsEngaged      : false,
   pendingM960         : false,
   pendingFeedMode     : undefined,
   pendingCoolant      : undefined,
   usePolarMode        : false,
+  useYAxisMode        : false,
   feedIsDPM           : false,
   machiningDirection  : undefined,
+  yAxisCAngle         : 0,
   isThreadMill        : false,
   threadMillCompPending : false,
   threadMillCompActive : false,
@@ -431,6 +437,20 @@ function toPolar(x, y) {
   };
 }
 
+function isHoleMillingCycle() {
+  if (!hasParameter("operation:cycleType")) { return false; }
+  var ct = getParameter("operation:cycleType");
+  return ct == "thread-milling" || ct == "bore-milling" || ct == "circular-pocket-milling";
+}
+
+function rotateXY(x, y) {
+  var theta = machineState.yAxisCAngle;
+  if (theta == 0) { return {x: x, y: y}; }
+  var cosT = Math.cos(theta);
+  var sinT = Math.sin(theta);
+  return {x: x * cosT + y * sinT, y: -x * sinT + y * cosT};
+}
+
 function getPolarFeed(feed, xr, hasX, hasZ, hasC) {
   var cOnly = !hasX && !hasZ && hasC;
   if (cOnly != machineState.feedIsDPM) {
@@ -454,9 +474,10 @@ function flushPrePositionBuffer(cc) {
 }
 
 function engageCAxis() {
-  if (!machineState.cAxisIsEngaged) {
+  if (!machineState.cAxisIsEngaged || machineState.yAxisIsEngaged) {
     writeBlock(gMachiningModeModal.format(271));
     machineState.cAxisIsEngaged = true;
+    machineState.yAxisIsEngaged = false;
     machineState.pendingM960 = true;
     gMotionModal.reset();
   }
@@ -488,9 +509,19 @@ function flushCoolant() {
 }
 
 function disengageCAxis() {
-  if (machineState.cAxisIsEngaged) {
+  if (machineState.cAxisIsEngaged || machineState.yAxisIsEngaged) {
     writeBlock(gMachiningModeModal.format(270));
     machineState.cAxisIsEngaged = false;
+    machineState.yAxisIsEngaged = false;
+    gMotionModal.reset();
+  }
+}
+
+function engageYAxis() {
+  if (!machineState.yAxisIsEngaged) {
+    writeBlock(gMachiningModeModal.format(272));
+    machineState.yAxisIsEngaged = true;
+    machineState.cAxisIsEngaged = true;
     gMotionModal.reset();
   }
 }
@@ -550,6 +581,7 @@ function writeComment(text) {
 
 function forceXYZ() {
   xOutput.reset();
+  xMillOutput.reset();
   yOutput.reset();
   zOutput.reset();
   cOutput.reset();
@@ -764,6 +796,12 @@ function onOpen() {
     }
   }
 
+  // Spindle control declaration — must come before comments on W-type machines
+  if (hasSubSpindle()) {
+    writeBlock(gFormat.format(140));
+  }
+  machineState.currentSpindle = 0;
+
   // Program comment
   if (programComment) {
     writeComment(programComment);
@@ -817,12 +855,6 @@ function onOpen() {
     }
   }
 
-  // Spindle control declaration — must come before any G-code on W-type machines
-  if (hasSubSpindle()) {
-    writeBlock(gFormat.format(140));
-  }
-  machineState.currentSpindle = 0;
-
   // Safe startup
   writeBlock(gAbsIncModal.format(90));
 
@@ -847,6 +879,7 @@ function onSection() {
   machineState.isTurningOperation = (currentSection.getType() == TYPE_TURNING);
   machineState.liveToolIsActive = false;
   machineState.usePolarMode = false;
+  machineState.useYAxisMode = false;
   machineState.cPrePositionPending = false;
   machineState.machiningDirection = undefined;
 
@@ -861,10 +894,25 @@ function onSection() {
           return;
         }
         machineState.liveToolIsActive = true;
+        if (machineState.machiningDirection == MACHINING_DIRECTION_AXIAL) {
+          if (forceYAxisMode) {
+            if (!hasYAxis()) {
+              error(localize("Cannot force G272: this machine does not have Y-axis capability."));
+              return;
+            }
+            machineState.useYAxisMode = true;
+          } else if (!forceCAxisMode && isHoleMillingCycle() && hasYAxis()) {
+            machineState.useYAxisMode = true;
+          }
+        }
       }
     } else if (currentSection.isMultiAxis()) {
       var isWrapped = currentSection.polarMode != undefined && currentSection.polarMode != POLAR_MODE_OFF;
       if (isWrapped) {
+        if (forceYAxisMode) {
+          error(localize("Cannot force G272 on wrapped toolpath. Wrapped operations require C-axis polar interpolation (G271)."));
+          return;
+        }
         if (!hasLiveTooling()) {
           error(localize("Wrapped milling requires live tooling. Enable the 'Type M' or 'Type TD' property."));
           return;
@@ -882,19 +930,41 @@ function onSection() {
       }
       machineState.liveToolIsActive = true;
       if (machineState.machiningDirection == MACHINING_DIRECTION_AXIAL) {
-        machineState.usePolarMode = true;
+        if (forceYAxisMode) {
+          if (!hasYAxis()) {
+            error(localize("Cannot force G272: this machine does not have Y-axis capability."));
+            return;
+          }
+          machineState.useYAxisMode = true;
+        } else if (forceCAxisMode) {
+          machineState.usePolarMode = true;
+        } else if (isHoleMillingCycle() && hasYAxis()) {
+          machineState.useYAxisMode = true;
+        } else {
+          machineState.usePolarMode = true;
+        }
       } else if (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) {
+        if (forceCAxisMode) {
+          error(localize("Cannot force G271 on radial operation. Radial milling requires Y-axis (G272)."));
+          return;
+        }
         if (!hasYAxis()) {
           error(localize("Radial milling requires a Y-axis (G272). This machine does not have Y-axis capability." +
             " Use 'Wrap' machining type in Fusion for C-axis substitution, or enable the Y-axis property."));
           return;
         }
+        machineState.useYAxisMode = true;
       } else {
+        if (forceCAxisMode) {
+          error(localize("Cannot force G271 on indexing operation. Indexing milling requires Y-axis (G272)."));
+          return;
+        }
         if (!hasYAxis()) {
           error(localize("This milling operation requires a Y-axis. Use 'Wrap' machining type in Fusion" +
             " for C-axis substitution, or enable the Y-axis property."));
           return;
         }
+        machineState.useYAxisMode = true;
       }
     } else {
       warning(localize("Unsupported milling operation type. Skipping operation."));
@@ -902,6 +972,9 @@ function onSection() {
       return;
     }
   }
+
+  forceYAxisMode = false;
+  forceCAxisMode = false;
 
   machineState.threadMill = {
     active: false,
@@ -1036,15 +1109,28 @@ function onSection() {
     }
   }
 
-  // Machining mode — reset modal on tool change so G270/G271 is explicit at each new tool
+  // Machining mode — reset modal on tool change so G270/G271/G272 is explicit at each new tool
   if (insertToolCall) {
     gMachiningModeModal.reset();
     machineState.cAxisIsEngaged = false;
+    machineState.yAxisIsEngaged = false;
   }
-  if (machineState.liveToolIsActive && !machineState.isTurningOperation) {
+  machineState.yAxisCAngle = 0;
+  if (machineState.useYAxisMode) {
+    engageYAxis();
+    if (machineState.machiningDirection == MACHINING_DIRECTION_AXIAL) {
+      var initPos = getFramePosition(currentSection.getInitialPosition());
+      var theta = Math.atan2(initPos.y, initPos.x);
+      machineState.yAxisCAngle = theta;
+      if (Math.abs(theta) > 1e-6) {
+        cOutput.reset();
+        writeBlock(gMotionModal.format(0), cOutput.format(theta));
+      }
+    }
+  } else if (machineState.liveToolIsActive && !machineState.isTurningOperation) {
     engageCAxis();
   } else {
-    if (machineState.cAxisIsEngaged) {
+    if (machineState.cAxisIsEngaged || machineState.yAxisIsEngaged) {
       disengageCAxis();
     } else {
       writeBlock(gMachiningModeModal.format(270));
@@ -1076,12 +1162,21 @@ function onSection() {
     }
   }
 
+  // Y-axis mode — M146 unclamp for milling contouring
+  if (machineState.useYAxisMode) {
+    writeBlock(mFormat.format(146));
+    gMotionModal.reset();
+  }
+
   // Position to initial point
   forceAny();
   gMotionModal.reset();
 
   var initialPosition = getFramePosition(currentSection.getInitialPosition());
-  if (machineState.usePolarMode) {
+  if (machineState.useYAxisMode) {
+    var rot = rotateXY(initialPosition.x, initialPosition.y);
+    writeBlock(gMotionModal.format(0), xMillOutput.format(rot.x), yOutput.format(rot.y), zOutput.format(initialPosition.z));
+  } else if (machineState.usePolarMode) {
     var polar = toPolar(initialPosition.x, initialPosition.y);
     writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
     if (xFormat.isSignificant(polar.xr)) {
@@ -1130,6 +1225,16 @@ function onRadiusCompensation() {
 }
 
 function onRapid(_x, _y, _z) {
+  if (machineState.useYAxisMode) {
+    var rot = rotateXY(_x, _y);
+    var x = xMillOutput.format(rot.x);
+    var y = yOutput.format(rot.y);
+    var z = zOutput.format(_z);
+    if (x || y || z) {
+      writeBlock(gMotionModal.format(0), x, y, z);
+    }
+    return;
+  }
   if (machineState.usePolarMode) {
     var polar = toPolar(_x, _y);
     if (machineState.cPrePositionPending) {
@@ -1207,6 +1312,48 @@ function onLinear(_x, _y, _z, feed) {
       flushFeedMode()
     );
     forceFeed();
+    return;
+  }
+
+  if (machineState.useYAxisMode) {
+    var rot = rotateXY(_x, _y);
+    var x = xMillOutput.format(rot.x);
+    var y = yOutput.format(rot.y);
+    var z = zOutput.format(_z);
+    if (x || y || z) {
+      if (pendingRadiusCompensation >= 0) {
+        var effectiveComp = pendingRadiusCompensation;
+        pendingRadiusCompensation = -1;
+        var plane = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) ? gPlaneModal.format(19) : gPlaneModal.format(17);
+        switch (effectiveComp) {
+        case RADIUS_COMPENSATION_LEFT:
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, getFeed(feed), flushFeedMode(), plane);
+          break;
+        case RADIUS_COMPENSATION_RIGHT:
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, getFeed(feed), flushFeedMode(), plane);
+          break;
+        default:
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), flushFeedMode(), plane);
+        }
+      } else if (machineState.threadMill.compPending && !z && (x || y)) {
+        var tm = machineState.threadMill;
+        tm.compPending = false;
+        tm.compDeferred = true;
+        var plane = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) ? gPlaneModal.format(19) : gPlaneModal.format(17);
+        tm.bufferedArgs = {
+          motion: gMotionModal.format(1), x: x, y: y, z: z,
+          f: getFeed(feed), fm: flushFeedMode(), plane: plane
+        };
+      } else if (machineState.threadMill.compActive && machineState.threadMill.inHelix) {
+        var tm = machineState.threadMill;
+        tm.compActive = false;
+        tm.inHelix = false;
+        tm.compPending = true;
+        writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), flushFeedMode());
+      } else {
+        writeBlock(gMotionModal.format(1), x, y, z, getFeed(feed), flushFeedMode());
+      }
+    }
     return;
   }
 
@@ -1493,6 +1640,75 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
     return;
   }
 
+  if (machineState.useYAxisMode) {
+    var start = getCurrentPosition();
+    var directionCode = clockwise ? 2 : 3;
+    var rotEnd = rotateXY(x, y);
+    var rotIJ = rotateXY(cx - start.x, cy - start.y);
+    if (machineState.threadMill.active) {
+      var tm = machineState.threadMill;
+      if (tm.compDeferred) {
+        tm.compCode = clockwise ? 42 : 41;
+        var buf = tm.bufferedArgs;
+        writeBlock(buf.motion, buf.plane, gFormat.format(tm.compCode), buf.x, buf.y, buf.z, buf.f, buf.fm);
+        tm.compDeferred = false;
+        tm.compActive = true;
+        tm.bufferedArgs = undefined;
+      }
+      tm.inHelix = true;
+    }
+    if (isFullCircle()) {
+      if (getProperty("useRadius")) { linearize(tolerance); return; }
+      switch (getCircularPlane()) {
+      case PLANE_XY:
+        xMillOutput.reset();
+        yOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), iOutput.format(rotIJ.x, 0), jOutput.format(rotIJ.y, 0), getFeed(feed), gPlaneModal.format(17));
+        break;
+      case PLANE_YZ:
+        yOutput.reset();
+        zOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), jOutput.format(rotIJ.y, 0), kOutput.format(cz - start.z, 0), getFeed(feed), gPlaneModal.format(19));
+        break;
+      default:
+        linearize(tolerance);
+      }
+    } else if (getProperty("useRadius")) {
+      var r = getCircularRadius();
+      if (toDeg(getCircularSweep()) > (180 + 1e-9)) { linearize(tolerance); return; }
+      switch (getCircularPlane()) {
+      case PLANE_XY:
+        xMillOutput.reset();
+        yOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), xMillOutput.format(rotEnd.x), yOutput.format(rotEnd.y), zOutput.format(z), "L" + rFormat.format(r), getFeed(feed), gPlaneModal.format(17));
+        break;
+      case PLANE_YZ:
+        yOutput.reset();
+        zOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), xMillOutput.format(rotEnd.x), yOutput.format(rotEnd.y), zOutput.format(z), "L" + rFormat.format(r), getFeed(feed), gPlaneModal.format(19));
+        break;
+      default:
+        linearize(tolerance);
+      }
+    } else {
+      switch (getCircularPlane()) {
+      case PLANE_XY:
+        xMillOutput.reset();
+        yOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), xMillOutput.format(rotEnd.x), yOutput.format(rotEnd.y), zOutput.format(z), iOutput.format(rotIJ.x, 0), jOutput.format(rotIJ.y, 0), getFeed(feed), gPlaneModal.format(17));
+        break;
+      case PLANE_YZ:
+        yOutput.reset();
+        zOutput.reset();
+        writeBlock(gMotionModal.format(directionCode), xMillOutput.format(rotEnd.x), yOutput.format(rotEnd.y), zOutput.format(z), jOutput.format(rotIJ.y, 0), kOutput.format(cz - start.z, 0), getFeed(feed), gPlaneModal.format(19));
+        break;
+      default:
+        linearize(tolerance);
+      }
+    }
+    return;
+  }
+
   var start = getCurrentPosition();
   var directionCode = clockwise ? 2 : 3;
 
@@ -1747,6 +1963,14 @@ function writeDrillingCycle(cycleCode, x, z, params) {
 
 function onCyclePoint(x, y, z) {
   flushCoolant();
+  var tol = spatialFormat.getMinimumValue();
+  if (!machineState.liveToolIsActive && !machineState.isTurningOperation &&
+      (Math.abs(x) > tol || Math.abs(y) > tol)) {
+    error(localize("Dead-tool drilling at off-center position (X=" + spatialFormat.format(x) +
+      " Y=" + spatialFormat.format(y) + "). Dead tools can only drill at centerline (X0 Y0)." +
+      " Set this tool as a live tool to drill off-center holes."));
+    return;
+  }
   if (isRadialDrillMode()) {
     var mach = toMachineCoords(x, y, z);
     x = mach.x;
@@ -2059,6 +2283,20 @@ function onCycleEnd() {
 }
 
 function onParameter(name, value) {
+  if (name == "action") {
+    var upper = String(value).toUpperCase();
+    if (upper.indexOf("G272") >= 0) {
+      forceYAxisMode = true;
+      forceCAxisMode = false;
+    } else if (upper.indexOf("G271") >= 0) {
+      forceCAxisMode = true;
+      forceYAxisMode = false;
+    } else {
+      error(localize("Invalid Manual NC action: must include G271 or G272. Got: ") + value);
+      return;
+    }
+    writeComment(value);
+  }
 }
 
 function onSpindleSpeed(spindleSpeed) {
@@ -2165,6 +2403,7 @@ function onSectionEnd() {
     }
   }
 
+  machineState.yAxisCAngle = 0;
   forceAny();
   gPlaneModal.reset();
   gFeedModeModal.reset();
