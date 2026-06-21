@@ -46,7 +46,7 @@ Enable the properties that match your machine:
 - Automatic Y-axis preference for hole milling operations (thread mill, bore mill, circular mill)
 - Manual NC override — force G271 (C-axis) or G272 (Y-axis) per operation
 - C-axis pre-positioning with coordinate rotation (minimizes Y travel for off-center features)
-- Thread mill cutter compensation (G41/G42) in both G271 and G272 modes
+- Hole milling cutter compensation (G41/G42) designed, backlogged for consistent implementation across all cycle types
 - Dead-tool off-center drilling validation (prevents silent bad code)
 - Radial and indexing milling require Y-axis — post errors instead of producing wrong geometry
 

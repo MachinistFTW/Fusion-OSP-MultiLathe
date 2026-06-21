@@ -24,6 +24,10 @@ legal = "Copyright (c) 2025-2026 MachinistFTW - GPL v3";
 certificationLevel = 2;
 minimumRevision = 45909;
 
+if (typeof supportedFeatures != "undefined") {
+  supportedFeatures |= FEATURE_TOOL_CALL_CYCLE;
+}
+
 longDescription = "OSP-MultiLathe post processor for Okuma OSP-P300 and P500 control. Supports all single turret configurations.";
 
 extension = "min";
@@ -278,19 +282,16 @@ var xFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL, sca
 var zFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
 var rFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
 var feedFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
-var fpmFormat = createFormat({decimals:(unit == MM ? 2 : 3), type:FORMAT_REAL});
-var fprFormat = createFormat({type:FORMAT_REAL, decimals:(unit == MM ? 3 : 4), minimum:(unit == MM ? 0.001 : 0.0001)});
 var pitchFormat = createFormat({decimals:6, type:FORMAT_REAL});
 var toolFormat = createFormat({decimals:0, minDigitsLeft:4});
 var tool6Format = createFormat({decimals:0, minDigitsLeft:6}); // 6-digit for nose-R comp: RRTTOO
 var rpmFormat = createFormat({decimals:0});
 var secFormat = createFormat({decimals:2, type:FORMAT_REAL});
 var dwellFormat = createFormat({prefix:"F", decimals:2, type:FORMAT_REAL});
-var taperFormat = createFormat({decimals:1, scale:DEG});
-var integerFormat = createFormat({decimals:0});
 var oFormat = createFormat({decimals:0, minDigitsLeft:4});
 
 var yFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
+var wFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
 var cFormat = createFormat({decimals:3, type:FORMAT_REAL, scale:DEG});
 
 // output variables
@@ -298,6 +299,7 @@ var xOutput = createOutputVariable({prefix:"X"}, xFormat);
 var xMillOutput = createOutputVariable({prefix:"X"}, spatialFormat); // G272 radial mode — no diameter doubling
 var yOutput = createOutputVariable({prefix:"Y"}, yFormat);
 var zOutput = createOutputVariable({prefix:"Z"}, zFormat);
+var wOutput = createOutputVariable({prefix:"W"}, wFormat);
 var cOutput = createOutputVariable({prefix:"C"}, cFormat);
 var feedOutput = createOutputVariable({prefix:"F"}, feedFormat);
 var pitchOutput = createOutputVariable({prefix:"F", control:CONTROL_FORCE}, pitchFormat);
@@ -325,9 +327,6 @@ var sequenceNumber;
 var showSequenceNumbers;
 var optionalSection = false;
 var forceSpindleSpeed = false;
-var activeMovements;
-var currentFeedId;
-var tapping = false;
 var previousMaximumSpeed = 0;
 var lastSpindleMode = undefined;
 var lastSpindleSpeed = 0;
@@ -369,11 +368,10 @@ var machineState = {
   feedIsDPM           : false,
   machiningDirection  : undefined,
   yAxisCAngle         : 0,
-  isThreadMill        : false,
-  threadMillCompPending : false,
-  threadMillCompActive : false,
-  threadMillCompCode  : 42,
-  threadMillInHelix   : false
+  toolIsLoaded          : false,
+  skipSection           : false,
+  stockTransferIsActive : false,
+  subSpindleChuckPosition : 0
 };
 
 function hasLiveTooling() {
@@ -386,10 +384,6 @@ function hasYAxis() {
 
 function hasSubSpindle() {
   return getProperty("type3_W");
-}
-
-function isTD() {
-  return getProperty("type4_TD");
 }
 
 function getMaxSpindleSpeed() {
@@ -588,7 +582,6 @@ function forceXYZ() {
 }
 
 function forceFeed() {
-  currentFeedId = undefined;
   feedOutput.reset();
 }
 
@@ -606,17 +599,6 @@ function forceModals() {
 }
 
 function getFeed(f) {
-  if (activeMovements) {
-    var feedContext = activeMovements[movement];
-    if (feedContext != undefined) {
-      if (!feedFormat.areDifferent(feedContext.feed, feedContext.currentFeed || Number.POSITIVE_INFINITY)) {
-        if (feedContext.id == currentFeedId) {
-          return "";
-        }
-      }
-    }
-    currentFeedId = feedContext != undefined ? feedContext.id : undefined;
-  }
   var result = feedOutput.format(f);
   if (result) {
     var fm = flushFeedMode();
@@ -669,20 +651,10 @@ function getCoolantCodes(coolant) {
     m.push(mFormat.format(9));
   }
 
-  switch (coolant) {
-  case COOLANT_FLOOD:
-    m.push(mFormat.format(8));
-    break;
-  case COOLANT_THROUGH_TOOL:
-    m.push(mFormat.format(8));
-    break;
-  case COOLANT_MIST:
-    m.push(mFormat.format(8));
-    break;
-  default:
+  if (coolant != COOLANT_FLOOD && coolant != COOLANT_THROUGH_TOOL && coolant != COOLANT_MIST) {
     warning(localize("Coolant type not supported, using flood coolant."));
-    m.push(mFormat.format(8));
   }
+  m.push(mFormat.format(8));
 
   currentCoolantMode = coolant;
   return m;
@@ -875,6 +847,33 @@ function onComment(message) {
   writeComment(message);
 }
 
+function onSectionSpecialCycle() {
+  var strategy = hasParameter("operation-strategy") ? getParameter("operation-strategy") : "";
+  var isToolCall = (strategy == "turningToolCall");
+  if (strategy.indexOf("SecondarySpindle") >= 0 && !hasSubSpindle()) {
+    error(localize("Sub-spindle cycle requires Type W to be enabled."));
+    return;
+  }
+  writeln("");
+  if (hasParameter("operation-comment")) {
+    var comment = getParameter("operation-comment");
+    if (comment) {
+      if (isToolCall) {
+        var seqMode = getProperty("showSequenceNumbers");
+        if (seqMode == "toolChange" || seqMode == "operationChange") {
+          showSequenceNumbers = seqMode;
+          writeBlockWithSeqno(formatComment(comment));
+          showSequenceNumbers = "none";
+        } else {
+          writeComment(comment);
+        }
+      } else {
+        writeComment(comment);
+      }
+    }
+  }
+}
+
 function onSection() {
   machineState.isTurningOperation = (currentSection.getType() == TYPE_TURNING);
   machineState.liveToolIsActive = false;
@@ -920,7 +919,8 @@ function onSection() {
         machineState.liveToolIsActive = true;
         machineState.usePolarMode = true;
       } else {
-        error(localize("Multi-axis simultaneous toolpaths (4/5-axis) are not supported."));
+        warning(localize("Multi-axis simultaneous toolpaths (4/5-axis) are not supported. Skipping operation."));
+        machineState.skipSection = true;
         return;
       }
     } else if (currentSection.getType() == TYPE_MILLING) {
@@ -976,28 +976,10 @@ function onSection() {
   forceYAxisMode = false;
   forceCAxisMode = false;
 
-  machineState.threadMill = {
-    active: false,
-    compPending: false,
-    compActive: false,
-    compCode: 41,
-    compDeferred: false,
-    bufferedArgs: undefined,
-    inHelix: false
-  };
-  if (!machineState.isTurningOperation &&
-      hasParameter("operation:cycleType") &&
-      getParameter("operation:cycleType") == "thread-milling") {
-    machineState.threadMill.active = true;
-    machineState.threadMill.compPending = true;
-  }
-
-  tapping = isTappingCycle();
-
   var forceSectionRestart = optionalSection && !currentSection.isOptional();
   optionalSection = currentSection.isOptional();
 
-  var insertToolCall = isToolChangeNeeded("number", "compensationOffset") || forceSectionRestart;
+  var insertToolCall = isToolChangeNeeded("number", "compensationOffset") || forceSectionRestart || !machineState.toolIsLoaded;
 
   // End previous section if tool change needed
   if (!isFirstSection() && insertToolCall) {
@@ -1043,10 +1025,7 @@ function onSection() {
 
   machineState.compensationType = hasParameter("operation:compensationType") ? getParameter("operation:compensationType") : "computer";
 
-  if (machineState.threadMill.active) {
-    warning(localize("Thread mill: cutter comp enabled, format is WEAR (tool center). Set Nose-R to zero for this tool."));
-    writeComment("CUTTER COMP WEAR TYPE - SET NOSE-R TO ZERO");
-  } else if (machineState.compensationType == "control") {
+  if (machineState.compensationType == "control") {
     writeComment("CUTTER COMP CONTROL TYPE");
   } else if (machineState.compensationType == "wear") {
     writeComment("CUTTER COMP WEAR TYPE");
@@ -1103,6 +1082,11 @@ function onSection() {
     }
     var toolCall = "T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset);
     writeBlock(toolCall);
+    machineState.toolIsLoaded = true;
+
+    if (getProperty("optWorkOffsets") && currentSection.workOffset > 0) {
+      writeBlock("G15 H" + currentSection.workOffset);
+    }
 
     if (tool.comment) {
       writeComment(tool.comment);
@@ -1202,7 +1186,6 @@ function onSection() {
     startSpindle(true);
   }
 
-  activeMovements = undefined;
 }
 
 function onDwell(seconds) {
@@ -1225,6 +1208,7 @@ function onRadiusCompensation() {
 }
 
 function onRapid(_x, _y, _z) {
+  if (machineState.skipSection) { return; }
   if (machineState.useYAxisMode) {
     var rot = rotateXY(_x, _y);
     var x = xMillOutput.format(rot.x);
@@ -1265,13 +1249,6 @@ function onRapid(_x, _y, _z) {
         error(localize("Radius compensation mode cannot be changed at rapid traversal."));
         return;
       }
-      var tm = machineState.threadMill;
-      if (tm.compActive) {
-        writeBlock(gFormat.format(40));
-        tm.compActive = false;
-        tm.inHelix = false;
-        tm.compPending = true;
-      }
       writeBlock(gMotionModal.format(0), x, c, z, flushM960());
     }
     return;
@@ -1294,6 +1271,7 @@ function onRapid(_x, _y, _z) {
 }
 
 function onLinear(_x, _y, _z, feed) {
+  if (machineState.skipSection) { return; }
   flushCoolant();
   if (isSpeedFeedSynchronizationActive()) {
     var threadPitch = getParameter("operation:threadPitch");
@@ -1327,31 +1305,16 @@ function onLinear(_x, _y, _z, feed) {
         var plane = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) ? gPlaneModal.format(19) : gPlaneModal.format(17);
         switch (effectiveComp) {
         case RADIUS_COMPENSATION_LEFT:
-          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, getFeed(feed), flushFeedMode(), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, getFeed(feed), plane);
           break;
         case RADIUS_COMPENSATION_RIGHT:
-          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, getFeed(feed), flushFeedMode(), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, getFeed(feed), plane);
           break;
         default:
-          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), flushFeedMode(), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), plane);
         }
-      } else if (machineState.threadMill.compPending && !z && (x || y)) {
-        var tm = machineState.threadMill;
-        tm.compPending = false;
-        tm.compDeferred = true;
-        var plane = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) ? gPlaneModal.format(19) : gPlaneModal.format(17);
-        tm.bufferedArgs = {
-          motion: gMotionModal.format(1), x: x, y: y, z: z,
-          f: getFeed(feed), fm: flushFeedMode(), plane: plane
-        };
-      } else if (machineState.threadMill.compActive && machineState.threadMill.inHelix) {
-        var tm = machineState.threadMill;
-        tm.compActive = false;
-        tm.inHelix = false;
-        tm.compPending = true;
-        writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), flushFeedMode());
       } else {
-        writeBlock(gMotionModal.format(1), x, y, z, getFeed(feed), flushFeedMode());
+        writeBlock(gMotionModal.format(1), x, y, z, getFeed(feed));
       }
     }
     return;
@@ -1395,19 +1358,6 @@ function onLinear(_x, _y, _z, feed) {
         default:
           writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
         }
-      } else if (machineState.threadMill.compPending && !z && (x || c)) {
-        var tm = machineState.threadMill;
-        tm.compPending = false;
-        tm.compDeferred = true;
-        tm.bufferedArgs = {
-          motion: gMotionModal.format(101), x: x, c: c, z: z, f: f, m960: flushM960()
-        };
-      } else if (machineState.threadMill.compActive && machineState.threadMill.inHelix) {
-        var tm = machineState.threadMill;
-        tm.compActive = false;
-        tm.inHelix = false;
-        tm.compPending = true;
-        writeBlock(gMotionModal.format(101), gFormat.format(40), x, c, z, f, flushM960());
       } else {
         writeBlock(gMotionModal.format(101), x, c, z, f, flushM960());
       }
@@ -1443,6 +1393,7 @@ function onLinear(_x, _y, _z, feed) {
 }
 
 function onRapid5D(_x, _y, _z, _a, _b, _c) {
+  if (machineState.skipSection) { return; }
   if (!machineState.usePolarMode) {
     error(localize("Multi-axis simultaneous toolpath is not supported by the post."));
     return;
@@ -1461,6 +1412,7 @@ function onRapid5D(_x, _y, _z, _a, _b, _c) {
 }
 
 function onLinear5D(_x, _y, _z, _a, _b, _c, feed) {
+  if (machineState.skipSection) { return; }
   if (!machineState.usePolarMode) {
     error(localize("Multi-axis simultaneous toolpath is not supported by the post."));
     return;
@@ -1492,6 +1444,7 @@ function onLinear5D(_x, _y, _z, _a, _b, _c, feed) {
 }
 
 function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
+  if (machineState.skipSection) { return; }
   flushCoolant();
   if (pendingRadiusCompensation >= 0) {
     error(localize("Radius compensation cannot be activated/deactivated for a circular move."));
@@ -1581,18 +1534,6 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
       forceFeed();
       machineState.feedIsDPM = false;
     }
-    if (machineState.threadMill.active) {
-      var tm = machineState.threadMill;
-      if (tm.compDeferred) {
-        tm.compCode = clockwise ? 42 : 41;
-        var buf = tm.bufferedArgs;
-        writeBlock(buf.motion, gFormat.format(17), gFormat.format(tm.compCode), buf.x, buf.c, buf.z, buf.f, buf.m960);
-        tm.compDeferred = false;
-        tm.compActive = true;
-        tm.bufferedArgs = undefined;
-      }
-      tm.inHelix = true;
-    }
     if (isFullCircle() || toDeg(getCircularSweep()) > (180 + 1e-9)) {
       var start = getCurrentPosition();
       var r = getCircularRadius();
@@ -1645,18 +1586,6 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
     var directionCode = clockwise ? 2 : 3;
     var rotEnd = rotateXY(x, y);
     var rotIJ = rotateXY(cx - start.x, cy - start.y);
-    if (machineState.threadMill.active) {
-      var tm = machineState.threadMill;
-      if (tm.compDeferred) {
-        tm.compCode = clockwise ? 42 : 41;
-        var buf = tm.bufferedArgs;
-        writeBlock(buf.motion, buf.plane, gFormat.format(tm.compCode), buf.x, buf.y, buf.z, buf.f, buf.fm);
-        tm.compDeferred = false;
-        tm.compActive = true;
-        tm.bufferedArgs = undefined;
-      }
-      tm.inHelix = true;
-    }
     if (isFullCircle()) {
       if (getProperty("useRadius")) { linearize(tolerance); return; }
       switch (getCircularPlane()) {
@@ -1872,7 +1801,8 @@ function onCyclePath() {
   feedOutput.disable();
   showSequenceNumbers = "none";
   redirectToBuffer();
-  writeBlock("NAT" + getCurrentSectionId() + " " + (verticalPasses ? "G82" : "G81"));
+  var cycleId = getCurrentSectionId() + 1;
+  writeBlock("NC" + cycleId + " " + (verticalPasses ? "G82" : "G81"));
   gMotionModal.reset();
   xOutput.reset();
   zOutput.reset();
@@ -1892,7 +1822,8 @@ function onCyclePathEnd() {
 
   switch (cycleType) {
   case "turning-canned-rough":
-    writeBlock(gFormat.format(85), "NAT" + getCurrentSectionId() +
+    var cycleId = getCurrentSectionId() + 1;
+    writeBlock(gFormat.format(85), "NC" + cycleId +
         " D" + spatialFormat.format(cycle.depthOfCut) +
         " U" + xFormat.format(Math.abs(cycle.xStockToLeave)) +
         " W" + spatialFormat.format(Math.abs(cycle.zStockToLeave)) +
@@ -1910,9 +1841,6 @@ function onCyclePathEnd() {
       writeBlock(cyclePath[i]);
     }
   }
-}
-
-function onCycle() {
 }
 
 function writeDrillingCycle(cycleCode, x, z, params) {
@@ -1961,14 +1889,100 @@ function writeDrillingCycle(cycleCode, x, z, params) {
   }
 }
 
+function writeSubSpindleGrab() {
+  writeBlock(mFormat.format(185), mFormat.format(247), formatComment("L/R INTERLOCK RELEASE"));
+  writeBlock(mFormat.format(249), formatComment("SUB CHUCK OPEN"));
+  writeBlock(gFormat.format(4), dwellFormat.format(cycle.dwell));
+  if (cycle.stopSpindle) {
+    writeBlock(mFormat.format(5));
+  } else {
+    writeBlock(gSpindleModeModal.format(97), sOutput.format(cycle.spindleSpeed), mFormat.format(3));
+    writeBlock(mFormat.format(151), formatComment("SYNC SPINDLES"));
+  }
+  gMotionModal.reset();
+  wOutput.reset();
+  writeBlock(gMotionModal.format(0), wOutput.format(cycle.feedPosition));
+  writeBlock(gFeedModeModal.format(94));
+  gMotionModal.reset();
+  wOutput.reset();
+  writeBlock(gMotionModal.format(1), wOutput.format(cycle.chuckPosition), "F" + feedFormat.format(cycle.feedrate));
+  writeBlock(mFormat.format(248), formatComment("SUB CHUCK CLAMP"));
+  writeBlock(gFormat.format(4), dwellFormat.format(cycle.dwell));
+  machineState.stockTransferIsActive = true;
+  machineState.subSpindleChuckPosition = cycle.chuckPosition;
+}
+
+function writeSubSpindlePull() {
+  if (!machineState.stockTransferIsActive) {
+    error(localize("Part must be grabbed before a pull operation."));
+    return;
+  }
+  writeBlock(mFormat.format(84), formatComment("MAIN CHUCK OPEN"));
+  writeBlock(gFormat.format(4), dwellFormat.format(cycle.dwell));
+  writeBlock(gFeedModeModal.format(94));
+  gMotionModal.reset();
+  wOutput.reset();
+  var pullPosition = machineState.subSpindleChuckPosition + cycle.pullingDistance;
+  writeBlock(gMotionModal.format(1), wOutput.format(pullPosition), "F" + feedFormat.format(cycle.feedrate));
+  writeBlock(mFormat.format(83), formatComment("MAIN CHUCK CLAMP"));
+  writeBlock(gFormat.format(4), dwellFormat.format(cycle.dwell));
+}
+
+function writeSubSpindleReturn() {
+  if (cycle.unclampMode == "unclamp-primary") {
+    writeBlock(mFormat.format(84), formatComment("MAIN CHUCK OPEN"));
+  } else if (cycle.unclampMode == "unclamp-secondary") {
+    writeBlock(mFormat.format(249), formatComment("SUB CHUCK OPEN"));
+  }
+  writeBlock(gFormat.format(4), dwellFormat.format(cycle.dwell));
+  gMotionModal.reset();
+  wOutput.reset();
+  writeBlock(gMotionModal.format(0), wOutput.format(cycle.feedPosition));
+  writeBlock(mFormat.format(150), formatComment("UNSYNC SPINDLES"));
+  writeBlock(mFormat.format(184), mFormat.format(246), formatComment("L/R INTERLOCK ON"));
+  machineState.stockTransferIsActive = false;
+}
+
+function onCycle() {
+  switch (cycleType) {
+  case "tool-call":
+    gMachiningModeModal.reset();
+    writeBlock(gMachiningModeModal.format(270));
+    var compensationOffset = tool.compensationOffset;
+    if (compensationOffset == 0) {
+      compensationOffset = tool.number;
+    }
+    writeBlock("T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset));
+    gMotionModal.reset();
+    writeRetract(X);
+    if (cycle.toolCallPosition !== undefined) {
+      zOutput.reset();
+      writeBlock(gMotionModal.format(0), zOutput.format(cycle.toolCallPosition));
+    }
+    writeBlock(mFormat.format(1));
+    machineState.toolIsLoaded = false;
+    break;
+  case "secondary-spindle-grab":
+    writeSubSpindleGrab();
+    break;
+  case "secondary-spindle-pull":
+    writeSubSpindlePull();
+    break;
+  case "secondary-spindle-return":
+    writeSubSpindleReturn();
+    break;
+  }
+}
+
 function onCyclePoint(x, y, z) {
   flushCoolant();
   var tol = spatialFormat.getMinimumValue();
   if (!machineState.liveToolIsActive && !machineState.isTurningOperation &&
       (Math.abs(x) > tol || Math.abs(y) > tol)) {
-    error(localize("Dead-tool drilling at off-center position (X=" + spatialFormat.format(x) +
+    warning(localize("Dead-tool drilling at off-center position (X=" + spatialFormat.format(x) +
       " Y=" + spatialFormat.format(y) + "). Dead tools can only drill at centerline (X0 Y0)." +
-      " Set this tool as a live tool to drill off-center holes."));
+      " Set this tool as a live tool to drill off-center holes. Skipping operation."));
+    machineState.skipSection = true;
     return;
   }
   if (isRadialDrillMode()) {
@@ -2274,12 +2288,23 @@ function onCyclePoint(x, y, z) {
 }
 
 function onCycleEnd() {
+  if (cycleType == "secondary-spindle-grab" ||
+      cycleType == "secondary-spindle-pull" ||
+      cycleType == "secondary-spindle-return" ||
+      cycleType == "tool-call") {
+    return;
+  }
   if (!cycleExpanded && !machineState.customCycleExpanded) {
     writeBlock(gCycleModal.format(machineState.liveToolIsActive ? 180 : 80));
     gMotionModal.reset();
   }
   machineState.customCycleExpanded = false;
   skipThreading = false;
+}
+
+function onSectionEndSpecialCycle() {
+  forceAny();
+  gFeedModeModal.reset();
 }
 
 function onParameter(name, value) {
@@ -2371,11 +2396,11 @@ function onPassThrough(text) {
 }
 
 function onSectionEnd() {
-  if (machineState.threadMill.compActive) {
-    writeBlock(gFormat.format(40));
-    machineState.threadMill.compActive = false;
+  if (machineState.skipSection) {
+    machineState.skipSection = false;
+    forceAny();
+    return;
   }
-
   if (machineState.usePolarMode) {
     machineState.usePolarMode = false;
     machineState.feedIsDPM = false;
