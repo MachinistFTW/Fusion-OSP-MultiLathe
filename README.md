@@ -13,6 +13,8 @@ Enable the properties that match your machine:
 | **Type W** | Sub-spindle |
 | **Type TD** | ATC tool change (TD command) — Multus and other multi-tasking machines |
 
+
+
 ## Current Status
 
 **Phase 1 — Basic Lathe** (complete)
@@ -67,6 +69,16 @@ Enable the properties that match your machine:
 - 3+2 positioning
 - B-axis support (G148/G149)
 - 5-axis simultaneous contouring
+
+## Optional Coffee Fund
+
+This post is free to you and it always will be. No paywall, no nag screens, no catch, just good old GPLv3 licences. If it earned its keep on your machine and you feel like throwing a few bucks my way, there's a tip jar — entirely optional, always appreciated.
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/machinistFTW)
+
+Prefer a link? **[ko-fi.com/machinistFTW](https://ko-fi.com/machinistFTW)** — or scan:
+
+<img src="assets/ko-fi.qrcode.png" alt="Ko-fi donation QR code" width="160">
 
 ## When Does the Post Use Y-Axis vs C-Axis?
 

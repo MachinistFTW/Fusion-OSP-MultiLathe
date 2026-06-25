@@ -371,7 +371,8 @@ var machineState = {
   toolIsLoaded          : false,
   skipSection           : false,
   stockTransferIsActive : false,
-  subSpindleChuckPosition : 0
+  subSpindleChuckPosition : 0,
+  currentWorkOffset     : -1
 };
 
 function hasLiveTooling() {
@@ -469,6 +470,12 @@ function flushPrePositionBuffer(cc) {
 
 function engageCAxis() {
   if (!machineState.cAxisIsEngaged || machineState.yAxisIsEngaged) {
+    if (!machineState.cAxisIsEngaged && !machineState.yAxisIsEngaged && lastSpindleSpeed > 0) {
+      gSpindleModeModal.reset();
+      sOutput.reset();
+      writeBlock(gSpindleModeModal.format(97), sOutput.format(lastSpindleSpeed), mFormat.format(5));
+      forceSpindleSpeed = true;
+    }
     writeBlock(gMachiningModeModal.format(271));
     machineState.cAxisIsEngaged = true;
     machineState.yAxisIsEngaged = false;
@@ -513,6 +520,12 @@ function disengageCAxis() {
 
 function engageYAxis() {
   if (!machineState.yAxisIsEngaged) {
+    if (!machineState.cAxisIsEngaged && !machineState.yAxisIsEngaged && lastSpindleSpeed > 0) {
+      gSpindleModeModal.reset();
+      sOutput.reset();
+      writeBlock(gSpindleModeModal.format(97), sOutput.format(lastSpindleSpeed), mFormat.format(5));
+      forceSpindleSpeed = true;
+    }
     writeBlock(gMachiningModeModal.format(272));
     machineState.yAxisIsEngaged = true;
     machineState.cAxisIsEngaged = true;
@@ -1086,6 +1099,7 @@ function onSection() {
 
     if (getProperty("optWorkOffsets") && currentSection.workOffset > 0) {
       writeBlock("G15 H" + currentSection.workOffset);
+      machineState.currentWorkOffset = currentSection.workOffset;
     }
 
     if (tool.comment) {
@@ -1303,15 +1317,18 @@ function onLinear(_x, _y, _z, feed) {
         var effectiveComp = pendingRadiusCompensation;
         pendingRadiusCompensation = -1;
         var plane = (machineState.machiningDirection == MACHINING_DIRECTION_RADIAL) ? gPlaneModal.format(19) : gPlaneModal.format(17);
+        if (plane) {
+          writeBlock(plane);
+        }
         switch (effectiveComp) {
         case RADIUS_COMPENSATION_LEFT:
-          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, getFeed(feed), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, getFeed(feed));
           break;
         case RADIUS_COMPENSATION_RIGHT:
-          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, getFeed(feed), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, getFeed(feed));
           break;
         default:
-          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed), plane);
+          writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, getFeed(feed));
         }
       } else {
         writeBlock(gMotionModal.format(1), x, y, z, getFeed(feed));
@@ -1376,15 +1393,19 @@ function onLinear(_x, _y, _z, feed) {
     if (pendingRadiusCompensation >= 0) {
       var effectiveComp = pendingRadiusCompensation;
       pendingRadiusCompensation = -1;
+      var planeCode = gPlaneModal.format(18);
+      if (planeCode) {
+        writeBlock(planeCode);
+      }
       switch (effectiveComp) {
       case RADIUS_COMPENSATION_LEFT:
-        writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, getFeed(feed), gPlaneModal.format(18));
+        writeBlock(gMotionModal.format(1), gFormat.format(41), x, z, getFeed(feed));
         break;
       case RADIUS_COMPENSATION_RIGHT:
-        writeBlock(gMotionModal.format(1), gFormat.format(42), x, z, getFeed(feed), gPlaneModal.format(18));
+        writeBlock(gMotionModal.format(1), gFormat.format(42), x, z, getFeed(feed));
         break;
       default:
-        writeBlock(gMotionModal.format(1), gFormat.format(40), x, z, getFeed(feed), gPlaneModal.format(18));
+        writeBlock(gMotionModal.format(1), gFormat.format(40), x, z, getFeed(feed));
       }
     } else {
       writeBlock(gMotionModal.format(1), x, z, getFeed(feed));
@@ -1798,9 +1819,13 @@ function onCyclePath() {
     error(localize("Unsupported passes type."));
     return;
   }
-  feedOutput.disable();
+  var pendingFM = flushFeedMode();
+  if (pendingFM) {
+    writeBlock(pendingFM);
+  }
   showSequenceNumbers = "none";
   redirectToBuffer();
+  feedOutput.reset();
   var cycleId = getCurrentSectionId() + 1;
   writeBlock("NC" + cycleId + " " + (verticalPasses ? "G82" : "G81"));
   gMotionModal.reset();
@@ -1811,7 +1836,6 @@ function onCyclePath() {
 function onCyclePathEnd() {
   writeBlock(gFormat.format(80));
   showSequenceNumbers = saveShowSequenceNumbers;
-  feedOutput.enable();
   var cyclePath = String(getRedirectionBuffer()).split(EOL);
   closeRedirection();
   for (line in cyclePath) {
@@ -1826,8 +1850,7 @@ function onCyclePathEnd() {
     writeBlock(gFormat.format(85), "NC" + cycleId +
         " D" + spatialFormat.format(cycle.depthOfCut) +
         " U" + xFormat.format(Math.abs(cycle.xStockToLeave)) +
-        " W" + spatialFormat.format(Math.abs(cycle.zStockToLeave)) +
-        " " + getFeed(cycle.cutfeedrate)
+        " W" + spatialFormat.format(Math.abs(cycle.zStockToLeave))
     );
     break;
   default:
@@ -2072,12 +2095,19 @@ function onCyclePoint(x, y, z) {
   case "deep-drilling":
     if (isFirstCyclePoint()) {
       var P = !cycle.dwell ? 0 : cycle.dwell;
-      writeDrillingCycle(machineState.liveToolIsActive ? 183 : 74, x, z, [
-        "D" + spatialFormat.format(cycle.incrementalDepth),
-        "L" + spatialFormat.format(cycle.incrementalDepth),
-        P > 0 ? eOutput.format(P) : "",
-        getFeed(cycle.feedrate)
-      ]);
+      // Deep drilling = full retract between pecks. On the M-tool cycle (G183) the
+      // full-retract peck depth is L; D is NOT output here (D is the spindle-orient
+      // address and would put G183 into chip-break/partial-retract mode). The
+      // turning-spindle compound cycle (G74) keeps its existing D+L addressing.
+      var deepParams = machineState.liveToolIsActive ?
+        ["L" + spatialFormat.format(cycle.incrementalDepth)] :
+        ["D" + spatialFormat.format(cycle.incrementalDepth),
+         "L" + spatialFormat.format(cycle.incrementalDepth)];
+      if (P > 0) {
+        deepParams.push(eOutput.format(P));
+      }
+      deepParams.push(getFeed(cycle.feedrate));
+      writeDrillingCycle(machineState.liveToolIsActive ? 183 : 74, x, z, deepParams);
     }
     break;
 
@@ -2107,7 +2137,6 @@ function onCyclePoint(x, y, z) {
         ]);
       } else {
         writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
-          "D" + spatialFormat.format(cycle.depth + cycle.retract - cycle.stock),
           getFeed(cycle.feedrate)
         ]);
       }
@@ -2126,7 +2155,6 @@ function onCyclePoint(x, y, z) {
         ]);
       } else {
         writeDrillingCycle(reverseTap ? 179 : 178, x, z, [
-          "D" + spatialFormat.format(cycle.incrementalDepth),
           "L" + spatialFormat.format(cycle.incrementalDepth),
           getFeed(cycle.feedrate)
         ]);
@@ -2222,8 +2250,19 @@ function onCyclePoint(x, y, z) {
     var P = !cycle.dwell ? 0 : cycle.dwell;
     var startCode = machineState.liveToolIsActive ?
       (tool.clockwise ? 13 : 14) : (tool.clockwise ? 3 : 4);
+    var stopCode = machineState.liveToolIsActive ? 12 : 19;
     var isRadialBore = isRadialDrillMode();
     var shiftX = x + cycle.shift;
+
+    function writeOrient() {
+      if (machineState.liveToolIsActive) {
+        writeBlock(mFormat.format(229));
+        cOutput.reset();
+        writeBlock(gMotionModal.format(0), cOutput.format(0));
+      } else {
+        writeBlock(mFormat.format(19));
+      }
+    }
 
     if (!isFirstCyclePoint()) {
       xOutput.reset();
@@ -2232,7 +2271,7 @@ function onCyclePoint(x, y, z) {
     if (isRadialBore) {
       xOutput.reset();
       writeBlock(gMotionModal.format(0), xOutput.format(cycle.clearance / 2));
-      writeBlock(mFormat.format(19));
+      writeOrient();
       writeBlock(gMotionModal.format(0), zOutput.format(shiftX));
       xOutput.reset();
       writeBlock(gMotionModal.format(0), xOutput.format(x));
@@ -2244,7 +2283,7 @@ function onCyclePoint(x, y, z) {
       if (P > 0) {
         writeBlock(gFormat.format(4), eOutput.format(P));
       }
-      writeBlock(mFormat.format(19));
+      writeOrient();
       gMotionModal.reset();
       writeBlock(gMotionModal.format(0), zOutput.format(shiftX));
       xOutput.reset();
@@ -2254,7 +2293,7 @@ function onCyclePoint(x, y, z) {
     } else {
       zOutput.reset();
       writeBlock(gMotionModal.format(0), zOutput.format(cycle.clearance));
-      writeBlock(mFormat.format(19));
+      writeOrient();
       xOutput.reset();
       writeBlock(gMotionModal.format(0), xOutput.format(shiftX));
       zOutput.reset();
@@ -2268,7 +2307,7 @@ function onCyclePoint(x, y, z) {
       if (P > 0) {
         writeBlock(gFormat.format(4), eOutput.format(P));
       }
-      writeBlock(mFormat.format(19));
+      writeOrient();
       gMotionModal.reset();
       xOutput.reset();
       writeBlock(gMotionModal.format(0), xOutput.format(shiftX));
@@ -2357,7 +2396,13 @@ function onCommand(command) {
     forceSpindleSpeed = true;
     break;
   case COMMAND_ORIENTATE_SPINDLE:
-    writeBlock(mFormat.format(19));
+    if (machineState.liveToolIsActive) {
+      writeBlock(mFormat.format(229));
+      cOutput.reset();
+      writeBlock(gMotionModal.format(0), cOutput.format(0));
+    } else {
+      writeBlock(mFormat.format(19));
+    }
     forceSpindleSpeed = true;
     break;
   case COMMAND_START_SPINDLE:
@@ -2413,6 +2458,7 @@ function onSectionEnd() {
     writeBlock(mFormat.format(12));
     sbOutput.reset();
     machineState.liveToolIsActive = false;
+    forceSpindleSpeed = true;
   }
 
   // Switch G96→G97 only at tool changes or program end — safe to stay in G96 between same-tool ops
