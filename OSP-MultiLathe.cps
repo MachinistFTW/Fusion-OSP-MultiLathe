@@ -162,14 +162,6 @@ properties = {
     value      : 3500,
     scope      : "post"
   },
-  optNegativeNoseR: {
-    title      : "Negative Nose R",
-    description: "Enable if your machine supports negative nose radius compensation.",
-    group      : "Options",
-    type       : "boolean",
-    value      : false,
-    scope      : "post"
-  },
   optNCTailStock: {
     title      : "NC Tail Stock",
     description: "Enable if your machine has an NC-controlled tailstock.",
@@ -205,14 +197,6 @@ properties = {
   optWorkOffsets: {
     title      : "Work Offsets (G15 H#)",
     description: "Enable work offset support using G15 H# commands.",
-    group      : "Options",
-    type       : "boolean",
-    value      : false,
-    scope      : "post"
-  },
-  optYOffCenterTurning: {
-    title      : "Y Axis Off Center Turning",
-    description: "Enable Y-axis offset turning. Requires Type Y.",
     group      : "Options",
     type       : "boolean",
     value      : false,
@@ -285,10 +269,13 @@ var feedFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL})
 var pitchFormat = createFormat({decimals:6, type:FORMAT_REAL});
 var toolFormat = createFormat({decimals:0, minDigitsLeft:4});
 var tool6Format = createFormat({decimals:0, minDigitsLeft:6}); // 6-digit for nose-R comp: RRTTOO
+var tdPositionFormat = createFormat({decimals:0, minDigitsLeft:2});
+var tdToolFormat = createFormat({decimals:0, minDigitsLeft:4});
 var rpmFormat = createFormat({decimals:0});
 var secFormat = createFormat({decimals:2, type:FORMAT_REAL});
 var dwellFormat = createFormat({prefix:"F", decimals:2, type:FORMAT_REAL});
 var oFormat = createFormat({decimals:0, minDigitsLeft:4});
+var baFormat = createFormat({decimals:2, type:FORMAT_REAL});
 
 var yFormat = createFormat({decimals:(unit == MM ? 3 : 4), type:FORMAT_REAL});
 var wFormat = createFormat({decimals:(unit == MM ? 3 : 4), forceDecimal:true});
@@ -307,6 +294,7 @@ var sOutput = createOutputVariable({prefix:"S", control:CONTROL_FORCE}, rpmForma
 var sbOutput = createOutputVariable({prefix:"SB=", control:CONTROL_FORCE}, rpmFormat);
 var maxSpeedOutput = createOutputVariable({prefix:"S", control:CONTROL_FORCE}, rpmFormat);
 var eOutput = createOutputVariable({prefix:"E", control:CONTROL_FORCE}, secFormat);
+var baOutput = createOutputVariable({prefix:"BA=", control:CONTROL_FORCE}, baFormat);
 
 // circular output — Okuma uses I/K for center-point arcs
 var iOutput = createOutputVariable({prefix:"I", control:CONTROL_NONZERO}, spatialFormat);
@@ -372,7 +360,10 @@ var machineState = {
   skipSection           : false,
   stockTransferIsActive : false,
   subSpindleChuckPosition : 0,
-  currentWorkOffset     : -1
+  currentWorkOffset     : -1,
+  bAxisAngle            : undefined,
+  slantMachiningActive  : false,
+  manualNCPosition      : 0
 };
 
 function hasLiveTooling() {
@@ -385,6 +376,95 @@ function hasYAxis() {
 
 function hasSubSpindle() {
   return getProperty("type3_W");
+}
+
+function isTD() {
+  return getProperty("type4_TD");
+}
+
+function formatToolTD(pp, toolNumber) {
+  return "TD=" + tdPositionFormat.format(pp) + tdToolFormat.format(toolNumber);
+}
+
+function getPositionNumber(tool, section) {
+  if (machineState.manualNCPosition > 0) {
+    return machineState.manualNCPosition;
+  }
+
+  var isSubSpindle = (machineState.currentSpindle == 1);
+
+  if (tool.isTurningTool()) {
+    var orientation = 0;
+    if (hasParameter("operation:toolOrientation")) {
+      orientation = getParameter("operation:toolOrientation");
+    }
+    if (orientation >= 45) {
+      return isSubSpindle ? 7 : 1;
+    } else {
+      return isSubSpindle ? 11 : 5;
+    }
+  }
+
+  var fwd = section.workPlane.forward;
+  if (Math.abs(fwd.z) > 0.9) {
+    return isSubSpindle ? 7 : 1;
+  }
+  if (Math.abs(fwd.z) < 0.1) {
+    return isSubSpindle ? 11 : 5;
+  }
+
+  return isSubSpindle ? 7 : 1;
+}
+
+function getBAxisAngle(tool, section) {
+  var pp = getPositionNumber(tool, section);
+
+  if (pp >= 13) {
+    return undefined;
+  }
+
+  if (tool.isTurningTool()) {
+    var orientation = 0;
+    if (hasParameter("operation:toolOrientation")) {
+      orientation = getParameter("operation:toolOrientation");
+    }
+    if (orientation == 0 || orientation == 90) {
+      return undefined;
+    }
+    // BA measured from spindle face (BA=0). Standard OD position is BA=90.
+    // toolOrientation is the offset from the 90° base position.
+    return 90 - orientation;
+  }
+
+  var fwd = section.workPlane.forward;
+  if (Math.abs(fwd.z) > 0.9 || Math.abs(fwd.z) < 0.1) {
+    return undefined;
+  }
+
+  // BA=0 at spindle face (along Z), BA=90 at OD (perpendicular to Z)
+  var fwdPerp = Math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y);
+  var ba = Math.atan2(fwdPerp, fwd.z) * 180 / Math.PI;
+
+  return ba;
+}
+
+function needsSlantMachining(section) {
+  if (!isTD()) { return false; }
+  var tool = section.getTool();
+  if (tool.isTurningTool()) { return false; }
+  var fwd = section.workPlane.forward;
+  return (Math.abs(fwd.z) > 0.1 && Math.abs(fwd.z) < 0.9);
+}
+
+function writeSlantMachiningOn(angle) {
+  writeBlock("G127", "B" + baFormat.format(angle));
+  machineState.slantMachiningActive = true;
+  gMotionModal.reset();
+}
+
+function writeSlantMachiningOff() {
+  writeBlock(gFormat.format(126));
+  machineState.slantMachiningActive = false;
 }
 
 function getMaxSpindleSpeed() {
@@ -652,6 +732,38 @@ function getCoolantCodes(coolant) {
   forceCoolant = false;
 
   var m = [];
+
+  if (isTD()) {
+    if (coolant == COOLANT_OFF) {
+      if (currentCoolantMode != COOLANT_OFF) {
+        m.push(mFormat.format(262));
+      }
+      currentCoolantMode = COOLANT_OFF;
+      return m;
+    }
+    if (currentCoolantMode != COOLANT_OFF) {
+      m.push(mFormat.format(262));
+    }
+    switch (coolant) {
+    case COOLANT_FLOOD:
+      m.push(mFormat.format(263));
+      break;
+    case COOLANT_THROUGH_TOOL:
+      m.push(mFormat.format(175));
+      break;
+    case COOLANT_AIR:
+    case COOLANT_MIST:
+      m.push(mFormat.format(51));
+      break;
+    default:
+      warning(localize("Coolant type not supported, using flood coolant."));
+      m.push(mFormat.format(263));
+      break;
+    }
+    currentCoolantMode = coolant;
+    return m;
+  }
+
   if (coolant == COOLANT_OFF) {
     if (currentCoolantMode != COOLANT_OFF) {
       m.push(mFormat.format(9));
@@ -782,7 +894,7 @@ function onOpen() {
   }
 
   // Spindle control declaration — must come before comments on W-type machines
-  if (hasSubSpindle()) {
+  if (hasSubSpindle() || isTD()) {
     writeBlock(gFormat.format(140));
   }
   machineState.currentSpindle = 0;
@@ -826,11 +938,30 @@ function onOpen() {
       }
     }
 
+    var toolPositions = {};
+    if (isTD()) {
+      var numberOfSections = getNumberOfSections();
+      for (var i = 0; i < numberOfSections; ++i) {
+        var section = getSection(i);
+        var sTool = section.getTool();
+        if (toolPositions[sTool.number] === undefined) {
+          toolPositions[sTool.number] = getPositionNumber(sTool, section);
+        }
+      }
+    }
+
     var tools = getToolTable();
     if (tools.getNumberOfTools() > 0) {
       for (var i = 0; i < tools.getNumberOfTools(); ++i) {
         var tool = tools.getTool(i);
-        var toolText = "T" + toolFormat.format(tool.number) + " " +
+        var toolId;
+        if (isTD()) {
+          var pp = toolPositions[tool.number] !== undefined ? toolPositions[tool.number] : 1;
+          toolId = formatToolTD(pp, tool.number);
+        } else {
+          toolId = "T" + toolFormat.format(tool.number);
+        }
+        var toolText = toolId + " " +
           (tool.diameter != 0 ? "D=" + spatialFormat.format(tool.diameter) + " " : "") +
           (tool.isTurningTool() ? "NR=" + spatialFormat.format(tool.noseRadius) : "CR=" + spatialFormat.format(tool.cornerRadius)) +
           (zRanges[tool.number] ? " - ZMIN=" + spatialFormat.format(zRanges[tool.number].getMinimum()) : "") +
@@ -986,6 +1117,12 @@ function onSection() {
     }
   }
 
+  // TD slant machining (G127) requires Y-axis mode (G272)
+  if (needsSlantMachining(currentSection)) {
+    machineState.useYAxisMode = true;
+    machineState.usePolarMode = false;
+  }
+
   forceYAxisMode = false;
   forceCAxisMode = false;
 
@@ -1012,7 +1149,9 @@ function onSection() {
   }
   if (requestedSpindle != machineState.currentSpindle) {
     machineState.currentSpindle = requestedSpindle;
-    writeBlock(gFormat.format(requestedSpindle == 1 ? 141 : 140));
+    if (!isTD()) {
+      writeBlock(gFormat.format(requestedSpindle == 1 ? 141 : 140));
+    }
     var newMaxSpeed = getMaxSpindleSpeed();
     writeBlock(gFormat.format(50), maxSpeedOutput.format(newMaxSpeed));
     previousMaximumSpeed = newMaxSpeed;
@@ -1089,12 +1228,37 @@ function onSection() {
       showSequenceNumbers = "toolChange";
     }
 
-    var compensationOffset = tool.compensationOffset;
-    if (compensationOffset == 0) {
-      compensationOffset = tool.number;
+    if (isTD()) {
+      if (machineState.manualNCPosition >= 13) {
+        writeBlock(mFormat.format(0));
+        writeComment("SET P" + machineState.manualNCPosition + " OFFSET FOR TOOL " + tool.number);
+      }
+
+      var pp = getPositionNumber(tool, currentSection);
+      writeBlock(formatToolTD(pp, tool.number), mFormat.format(323));
+
+      var ba = getBAxisAngle(tool, currentSection);
+      if (ba !== undefined) {
+        writeBlock(baOutput.format(ba), gFormat.format(52));
+      }
+      machineState.bAxisAngle = ba;
+      machineState.manualNCPosition = 0;
+
+      if (!isLastSection()) {
+        var nextSection = getNextSection();
+        var nextTool = nextSection.getTool();
+        if (nextTool.number != tool.number) {
+          writeBlock("/" + "MT=" + tdToolFormat.format(nextTool.number) + tdPositionFormat.format(1));
+        }
+      }
+    } else {
+      var compensationOffset = tool.compensationOffset;
+      if (compensationOffset == 0) {
+        compensationOffset = tool.number;
+      }
+      var toolCall = "T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset);
+      writeBlock(toolCall);
     }
-    var toolCall = "T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset);
-    writeBlock(toolCall);
     machineState.toolIsLoaded = true;
 
     if (getProperty("optWorkOffsets") && currentSection.workOffset > 0) {
@@ -1193,6 +1357,11 @@ function onSection() {
     gMotionModal.reset();
     writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
     writeBlock(gMotionModal.format(0), xOutput.format(initialPosition.x));
+  }
+
+  // Slant machining for inclined 3+2 operations
+  if (needsSlantMachining(currentSection) && machineState.bAxisAngle !== undefined) {
+    writeSlantMachiningOn(machineState.bAxisAngle);
   }
 
   // Enable SFM after initial positioning
@@ -1971,11 +2140,20 @@ function onCycle() {
   case "tool-call":
     gMachiningModeModal.reset();
     writeBlock(gMachiningModeModal.format(270));
-    var compensationOffset = tool.compensationOffset;
-    if (compensationOffset == 0) {
-      compensationOffset = tool.number;
+    if (isTD()) {
+      var pp = getPositionNumber(tool, currentSection);
+      writeBlock(formatToolTD(pp, tool.number), mFormat.format(323));
+      var ba = getBAxisAngle(tool, currentSection);
+      if (ba !== undefined) {
+        writeBlock(baOutput.format(ba), gFormat.format(52));
+      }
+    } else {
+      var compensationOffset = tool.compensationOffset;
+      if (compensationOffset == 0) {
+        compensationOffset = tool.number;
+      }
+      writeBlock("T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset));
     }
-    writeBlock("T" + tool6Format.format(compensationOffset * 10000 + tool.number * 100 + compensationOffset));
     gMotionModal.reset();
     writeRetract(X);
     if (cycle.toolCallPosition !== undefined) {
@@ -2095,14 +2273,10 @@ function onCyclePoint(x, y, z) {
   case "deep-drilling":
     if (isFirstCyclePoint()) {
       var P = !cycle.dwell ? 0 : cycle.dwell;
-      // Deep drilling = full retract between pecks. On the M-tool cycle (G183) the
-      // full-retract peck depth is L; D is NOT output here (D is the spindle-orient
-      // address and would put G183 into chip-break/partial-retract mode). The
-      // turning-spindle compound cycle (G74) keeps its existing D+L addressing.
-      var deepParams = machineState.liveToolIsActive ?
-        ["L" + spatialFormat.format(cycle.incrementalDepth)] :
-        ["D" + spatialFormat.format(cycle.incrementalDepth),
-         "L" + spatialFormat.format(cycle.incrementalDepth)];
+      var deepParams = [
+        "D" + spatialFormat.format(cycle.incrementalDepth),
+        "L" + spatialFormat.format(cycle.incrementalDepth)
+      ];
       if (P > 0) {
         deepParams.push(eOutput.format(P));
       }
@@ -2355,6 +2529,20 @@ function onParameter(name, value) {
     } else if (upper.indexOf("G271") >= 0) {
       forceCAxisMode = true;
       forceYAxisMode = false;
+    } else if (isTD()) {
+      var pMatch = upper.match(/P(\d+)/);
+      if (pMatch) {
+        var pNum = parseInt(pMatch[1], 10);
+        if (pNum >= 13 && pNum <= 20) {
+          machineState.manualNCPosition = pNum;
+        } else {
+          error(localize("Manual NC position override must be P13-P20. Got: P") + pNum);
+          return;
+        }
+      } else {
+        error(localize("Invalid Manual NC action for TD machine: must include G271, G272, or P13-P20. Got: ") + value);
+        return;
+      }
     } else {
       error(localize("Invalid Manual NC action: must include G271 or G272. Got: ") + value);
       return;
@@ -2452,6 +2640,10 @@ function onSectionEnd() {
     gMotionModal.reset();
     gPlaneModal.reset();
     writeBlock(mFormat.format(147));
+  }
+
+  if (machineState.slantMachiningActive) {
+    writeSlantMachiningOff();
   }
 
   if (machineState.liveToolIsActive && !machineState.isTurningOperation) {

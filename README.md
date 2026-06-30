@@ -96,6 +96,10 @@ If your machine has a Y-axis (Type Y enabled), the post automatically decides wh
 
 **Overriding the default:** Insert a **Manual NC > Action** before any axial operation in Fusion. Type `G272` or `G271` anywhere in the text (e.g., "FORCE G272", "USE G271"). The override applies to the next operation only — subsequent operations return to the default. The post validates the override and errors if the combination is invalid (e.g., G272 on a machine without Y-axis, or G271 on a radial operation).
 
+## Backlog
+
+See [BACKLOG.md](BACKLOG.md) for known issues, planned features, and investigation notes.
+
 ## Safety Checks
 
 The post includes several guards against silent bad code:
