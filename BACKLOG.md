@@ -94,6 +94,8 @@ Tracked issues, planned features, and investigation items. Items are grouped by 
 
 - **Super Nurbs / Hyper Surface smoothing** — Option property added, logic TBD.
 
+- **Y-axis return to Y0 after off-center turning** — Machines with Y-axis off-center turning can leave Y at a non-zero position after the operation. The post should output G0 Y0. to return Y to a known zero after the tool runs. **Open question:** Can we safely output Y0 on ALL Y-axis machines at section end, or only on machines with the off-center turning option? If Y0 is harmless on machines without the option, it could be unconditional. If it causes issues (alarm, unexpected motion), it needs to be property-gated. Investigate before implementing.
+
 - **Load monitoring integration** — VLMON[tool]=bitmask, M215/M216.
 
 ---
